@@ -134,3 +134,105 @@ def merge_file_into(model: nn.Module, path, multiplier: float = 1.0) -> int:
         linear.weight.add_(delta.to(linear.weight.device, linear.weight.dtype))
         merged += 1
     return merged
+
+
+# --------------------------------------------------------------------------- inference-time stacking
+
+def read_lora_file(path) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
+    """Return {module_name: (A, B, alpha/rank)} for lora_A/lora_B or lora_down/lora_up files."""
+    sd = load_file(str(path))
+    out = {}
+    for key in sd:
+        for down, up in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight")):
+            if not key.endswith(down):
+                continue
+            name = key[:-len(down)]
+            b = sd.get(name + up)
+            if b is None:
+                continue
+            a = sd[key]
+            alpha = sd.get(name + ".alpha")
+            rank = a.shape[0]
+            scale = (float(alpha) / rank) if alpha is not None else 1.0
+            for prefix in (PREFIX, "transformer.", "model.diffusion_model."):
+                if name.startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            out[name] = (a, b, scale)
+    return out
+
+
+class DynamicLoRALinear(nn.Module):
+    """Linear layer with any number of LoRA adapters applied on the fly (base weights untouched)."""
+
+    def __init__(self, base: nn.Linear):
+        super().__init__()
+        self.base = base
+        self.adapters: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    def forward(self, x):
+        out = self.base(x)
+        for a, b, scale in self.adapters:
+            out = out + (nn.functional.linear(nn.functional.linear(x.to(a.dtype), a), b) * scale).to(out.dtype)
+        return out
+
+
+class LoRAStack:
+    """Activates a set of LoRA files with strengths on a transformer; switching is instant and exact."""
+
+    def __init__(self, model: nn.Module, max_cached: int = 8):
+        self.model = model
+        self.wrapped: dict[str, DynamicLoRALinear] = {}
+        self.cache: dict[tuple, dict] = {}
+        self.max_cached = max_cached
+
+    def _wrap(self, name):
+        if name in self.wrapped:
+            return self.wrapped[name]
+        try:
+            module = self.model.get_submodule(name)
+        except AttributeError:
+            return None
+        if isinstance(module, DynamicLoRALinear):
+            return module
+        if not isinstance(module, nn.Linear):
+            return None
+        parent_name, _, child = name.rpartition(".")
+        parent = self.model.get_submodule(parent_name) if parent_name else self.model
+        wrapped = DynamicLoRALinear(module)
+        if isinstance(parent, nn.ModuleDict):
+            parent[child] = wrapped
+        else:
+            setattr(parent, child, wrapped)
+        self.wrapped[name] = wrapped
+        return wrapped
+
+    def activate(self, specs, device, dtype=torch.bfloat16) -> dict[str, int]:
+        """specs: iterable of (path, strength). Returns {path: number_of_unmatched_modules}."""
+        for m in self.wrapped.values():
+            m.adapters.clear()
+        unmatched = {}
+        for path, strength in specs:
+            if not strength:
+                continue
+            from pathlib import Path
+            p = Path(path)
+            key = (str(p.resolve()), p.stat().st_mtime_ns)
+            if key not in self.cache:
+                if len(self.cache) >= self.max_cached:
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[key] = {n: (a.to(device, dtype), b.to(device, dtype), s)
+                                   for n, (a, b, s) in read_lora_file(p).items()}
+            miss = 0
+            for name, (a, b, scale) in self.cache[key].items():
+                mod = self._wrap(name)
+                if mod is None:
+                    miss += 1
+                    continue
+                mod.adapters.append((a, b, scale * float(strength)))
+            unmatched[str(path)] = miss
+        return unmatched

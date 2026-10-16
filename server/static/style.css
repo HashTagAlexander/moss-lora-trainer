@@ -227,3 +227,26 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
   .prompt-legend { margin-left: 0; }
   .sample-row { grid-template-columns: 1fr; }
 }
+
+/* ---------- generate ---------- */
+.gen-layout { display: grid; grid-template-columns: minmax(320px, 400px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.gen-controls { position: sticky; top: 16px; }
+.gen-form { display: grid; gap: 14px; }
+.gen-nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.gen-form details summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 500; user-select: none; }
+#g-go { justify-content: center; padding: 10px; font-size: 14px; }
+.lora-list { display: grid; gap: 6px; }
+.lora-row { display: grid; grid-template-columns: minmax(0, 1fr) 84px 60px 28px 28px; gap: 6px; align-items: center; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 6px 6px 10px; }
+.lora-row .lora-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--text); }
+.lora-row input[type=range] { accent-color: var(--accent); width: 100%; }
+.lora-row input[type=number] { padding: 4px 6px; font-size: 12px; }
+.lora-row .btn { padding: 4px; justify-content: center; }
+.gen-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 16px; align-items: start; }
+.gen-card { position: relative; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: var(--panel-2); }
+.gen-card img { width: 100%; display: block; object-fit: cover; cursor: zoom-in; }
+.gen-ov { position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 8px 8px; display: flex; gap: 6px; align-items: flex-end; background: linear-gradient(transparent, rgba(5, 6, 9, .9)); opacity: 0; transition: opacity .15s; pointer-events: none; }
+.gen-card:hover .gen-ov { opacity: 1; pointer-events: auto; }
+.gen-ov-text { flex: 1; min-width: 0; font-size: 11.5px; color: #d6dae3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.gen-ov .btn { padding: 5px; background: rgba(22, 26, 34, .9); }
+@media (hover: none) { .gen-ov { opacity: 1; pointer-events: auto; } }
+@media (max-width: 860px) { .gen-layout { grid-template-columns: 1fr; } .gen-controls { position: static; } }

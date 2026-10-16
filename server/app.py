@@ -34,7 +34,9 @@ from mosstrainer.config import DEFAULTS, MODELS, NAME_RE, validate  # noqa: E402
 WORKSPACE = Path(os.environ.get("MOSS_WORKSPACE", ROOT / "workspace")).resolve()
 DATASETS = WORKSPACE / "datasets"
 JOBS = WORKSPACE / "jobs"
-for d in (DATASETS, JOBS, WORKSPACE / "cache"):
+GENERATIONS = WORKSPACE / "generations"
+LORAS = WORKSPACE / "loras"
+for d in (DATASETS, JOBS, WORKSPACE / "cache", GENERATIONS, LORAS):
     d.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -144,6 +146,8 @@ class JobManager:
                                 cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, env=env,
                                 start_new_session=True)
         self.procs[name] = proc
+        if "gen_manager" in globals():
+            gen_manager.offload_te()  # give the trainer room on the GPU
         self.set_status(name, state="starting", pid=proc.pid, message="Starting trainer", step=self.status(name).get("step", 0))
 
     def _loop(self):
@@ -195,6 +199,131 @@ class JobManager:
 
 
 manager = JobManager()
+
+
+# --------------------------------------------------------------------------- generation worker
+
+class GenManager:
+    """Runs mosstrainer.generate_worker as a long-lived subprocess and feeds it one request at a time."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.proc: subprocess.Popen | None = None
+        self.queue: list[dict] = []
+        self.current: dict | None = None
+        self.state = "unloaded"
+        self.model = None
+        self.message = ""
+        self.last_error = ""
+        self.version = 0  # bumps whenever a new image lands
+        self.counter = 0
+
+    def _spawn(self):
+        log = open(GENERATIONS / "worker.log", "a")
+        log.write(f"\n===== worker start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        log.flush()
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        self.proc = subprocess.Popen([sys.executable, "-m", "mosstrainer.generate_worker"], cwd=str(ROOT),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, env=env,
+                                     text=True, bufsize=1, start_new_session=True)
+        self.state, self.model, self.message = "starting", None, "Starting worker…"
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            with self.lock:
+                kind = ev.get("event")
+                if kind == "status":
+                    self.state = ev.get("state", self.state)
+                    self.message = ev.get("message", "")
+                    if "model" in ev:
+                        self.model = ev["model"]
+                elif kind == "progress" and self.current and self.current["id"] == ev.get("id"):
+                    self.current["progress"] = ev
+                elif kind == "image":
+                    self.version += 1
+                    if self.current:
+                        self.current.setdefault("files", []).append(ev["file"])
+                elif kind == "warning":
+                    self.last_error = ev.get("message", "")
+                elif kind in ("done", "error", "cancelled"):
+                    if kind == "error":
+                        self.last_error = ev.get("message", "error")
+                    self.current = None
+                    self._dispatch()
+        with self.lock:  # worker exited
+            if self.proc is proc:
+                self.proc = None
+                self.state, self.model, self.message = "unloaded", None, ""
+                if self.current:
+                    self.last_error = "Generation worker crashed; see workspace/generations/worker.log"
+                    self.current = None
+                self._dispatch()
+
+    def _dispatch(self):
+        if self.current or not self.queue:
+            return
+        if self.proc is None or self.proc.poll() is not None:
+            self._spawn()
+        req = self.queue.pop(0)
+        req["low_vram"] = manager.running() is not None
+        req["out_dir"] = str(GENERATIONS)
+        self.current = req
+        try:
+            self.proc.stdin.write(json.dumps({**req, "cmd": "generate"}) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.current = None
+            self.queue.insert(0, req)
+
+    def submit(self, req: dict) -> str:
+        with self.lock:
+            self.counter += 1
+            req["id"] = f"{int(time.time()) % 100000:05d}{self.counter:03d}"
+            req["queued_at"] = time.time()
+            self.last_error = ""
+            self.queue.append(req)
+            self._dispatch()
+            return req["id"]
+
+    def cancel(self, rid: str):
+        with self.lock:
+            self.queue = [q for q in self.queue if q["id"] != rid]
+            if self.current and self.current["id"] == rid and self.proc:
+                os.kill(self.proc.pid, signal.SIGUSR1)
+
+    def offload_te(self):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write(json.dumps({"cmd": "offload"}) + "\n")
+                    self.proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+
+    def unload(self):
+        with self.lock:
+            self.queue.clear()
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+
+    def snapshot(self):
+        with self.lock:
+            brief = lambda r: {"id": r["id"], "prompt": r.get("prompt", "")[:200], "count": r.get("count", 1)}  # noqa: E731
+            cur = None
+            if self.current:
+                cur = {**brief(self.current), "progress": self.current.get("progress"),
+                       "files": self.current.get("files", [])}
+            return {"state": self.state, "model": self.model, "message": self.message, "current": cur,
+                    "queue": [brief(q) for q in self.queue], "last_error": self.last_error,
+                    "version": self.version, "training": manager.running()}
+
+
+gen_manager = GenManager()
 
 
 # --------------------------------------------------------------------------- system
@@ -542,6 +671,138 @@ def job_checkpoint(name: str, filename: str):
     if not path.exists() or path.suffix != ".safetensors":
         raise HTTPException(404)
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+
+# --------------------------------------------------------------------------- generation
+
+def lora_inventory():
+    out = []
+    for d in sorted(JOBS.iterdir()):
+        ck = d / "checkpoints"
+        if not ck.is_dir():
+            continue
+        cfg = read_json(d / "config.json", {})
+        for p in sorted(ck.glob("*.safetensors"), key=lambda p: p.stat().st_mtime, reverse=True):
+            stem = p.stem
+            step = stem.rsplit("_", 1)[-1] if stem != cfg.get("name") else str(cfg.get("train", {}).get("steps", ""))
+            out.append({"id": f"jobs/{d.name}/checkpoints/{p.name}", "file": p.name, "group": d.name,
+                        "label": f"{d.name} · {'final' if stem == cfg.get('name') else 'step ' + step.lstrip('0')}",
+                        "trigger": cfg.get("trigger_word", ""), "model": cfg.get("model"),
+                        "mtime": p.stat().st_mtime, "size": p.stat().st_size})
+    for p in sorted(LORAS.glob("*.safetensors")):
+        out.append({"id": f"loras/{p.name}", "file": p.name, "group": "Uploaded", "label": p.stem, "trigger": "",
+                    "model": None, "mtime": p.stat().st_mtime, "size": p.stat().st_size})
+    return out
+
+
+def resolve_lora(lora_id: str) -> Path:
+    path = (WORKSPACE / lora_id).resolve()
+    ok_roots = (JOBS.resolve(), LORAS.resolve())
+    if path.suffix != ".safetensors" or not path.is_file() or not any(path.is_relative_to(r) for r in ok_roots):
+        raise HTTPException(400, f"Unknown LoRA: {lora_id}")
+    return path
+
+
+@app.get("/api/loras")
+def list_loras():
+    return lora_inventory()
+
+
+@app.post("/api/loras/upload")
+async def upload_lora(files: list[UploadFile] = File(...)):
+    added = []
+    for f in files:
+        name = _clean_name(f.filename or "lora.safetensors")
+        if not name.endswith(".safetensors"):
+            raise HTTPException(400, "Only .safetensors LoRA files are supported")
+        target = _unique(LORAS, name)
+        with open(target, "wb") as out:
+            while chunk := await f.read(1 << 20):
+                out.write(chunk)
+        added.append(target.name)
+    return {"added": added}
+
+
+@app.delete("/api/loras/uploaded/{filename}")
+def delete_uploaded_lora(filename: str):
+    safe_file(LORAS, filename).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/api/generate")
+async def generate(request: Request):
+    body = await request.json()
+    prompt = str(body.get("prompt", "")).strip()
+    if not prompt:
+        raise HTTPException(400, "Write a prompt first")
+    try:
+        width, height = int(body.get("width", 1024)), int(body.get("height", 1024))
+        steps, count = int(body.get("steps", 50)), int(body.get("count", 1))
+        cfg, shift = float(body.get("cfg", 3.0)), float(body.get("shift", 5.0))
+        seed, skip = int(body.get("seed", -1)), int(body.get("skip_layer", 22))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Invalid number in settings")
+    if not (256 <= width <= 2048 and 256 <= height <= 2048):
+        raise HTTPException(400, "Width and height must be between 256 and 2048")
+    if not 1 <= steps <= 150 or not 1 <= count <= 8:
+        raise HTTPException(400, "Steps must be 1-150 and count 1-8")
+    model = body.get("model") or DEFAULTS["model"]
+    if model not in MODELS and not Path(model).is_dir():
+        raise HTTPException(400, "Unknown model")
+    loras = []
+    for lr in body.get("loras", []) or []:
+        path = resolve_lora(str(lr.get("id", "")))
+        loras.append({"id": lr["id"], "path": str(path), "name": lr.get("name") or path.stem,
+                      "strength": max(-4.0, min(4.0, float(lr.get("strength", 1.0))))})
+    rid = gen_manager.submit({"model": model, "prompt": prompt, "negative": str(body.get("negative", "")),
+                              "width": width, "height": height, "steps": steps, "cfg": cfg, "shift": shift,
+                              "seed": seed, "count": count, "skip_layer": skip, "loras": loras})
+    return {"id": rid}
+
+
+@app.get("/api/generate/status")
+def generate_status():
+    return gen_manager.snapshot()
+
+
+@app.post("/api/generate/cancel/{rid}")
+def generate_cancel(rid: str):
+    gen_manager.cancel(rid)
+    return {"ok": True}
+
+
+@app.post("/api/generate/unload")
+def generate_unload():
+    gen_manager.unload()
+    return {"ok": True}
+
+
+@app.get("/api/generations")
+def list_generations(limit: int = 120, offset: int = 0):
+    metas = sorted(GENERATIONS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for m in metas[offset:offset + limit]:
+        meta = read_json(m, {})
+        out.append({**meta, "file": m.with_suffix(".png").name, "thumb": m.with_suffix(".thumb.jpg").name})
+    return {"items": out, "total": len(metas)}
+
+
+@app.get("/api/generations/file/{filename}")
+def generation_file(filename: str):
+    path = safe_file(GENERATIONS, filename)
+    if not path.exists() or path.suffix not in (".png", ".jpg"):
+        raise HTTPException(404)
+    return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
+
+
+@app.delete("/api/generations/{filename}")
+def delete_generation(filename: str):
+    png = safe_file(GENERATIONS, filename)
+    stem = png.name[:-len(".png")] if png.name.endswith(".png") else png.stem
+    for suffix in (".png", ".thumb.jpg", ".json"):
+        (GENERATIONS / f"{stem}{suffix}").unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @app.exception_handler(HTTPException)

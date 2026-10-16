@@ -76,6 +76,11 @@ With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 2
 
 ## Using the LoRA
 
+- **Generate tab** (built in): stack any of your checkpoints (or uploaded `.safetensors` LoRAs) with
+  per-LoRA strength, pick an aspect ratio and size, and generate with the official sampler. The model stays
+  loaded between generations and is unloaded after 15 idle minutes or with **Unload**. Each checkpoint
+  row has a **Generate** button that pre-fills its LoRA and trigger word. Images and their settings are
+  kept in `moss_workspace/generations/`, and **Use these settings** restores any past image's exact settings.
 - **ComfyUI**: install the MOSS-Image ComfyUI plugin from the MOSS-Image repo, load the model with its loader, then
   apply the LoRA with a standard `LoraLoaderModelOnly` node.
 - **Diffusers / CLI**:

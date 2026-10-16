@@ -76,6 +76,9 @@ const I = {
   flask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v6L4.5 18.5A1.7 1.7 0 0 0 6 21h12a1.7 1.7 0 0 0 1.5-2.5L14 9V3"/><path d="M7 15h10"/></svg>',
   left: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>',
   right: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
+  spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8Z"/></svg>',
+  dice: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="16" cy="16" r="1.2" fill="currentColor"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/></svg>',
+  reuse: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>',
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
 };
 
@@ -163,6 +166,7 @@ const routes = [
   [/^\/jobs\/([^/]+)$/, "dashboard", pageJob],
   [/^\/datasets$/, "datasets", pageDatasets],
   [/^\/datasets\/([^/]+)$/, "datasets", pageDataset],
+  [/^\/generate$/, "generate", pageGenerate],
 ];
 
 async function route() {
@@ -406,7 +410,7 @@ async function pageJob(name) {
     if (!job.checkpoints.length) { el.innerHTML = `<div class="empty">No checkpoints saved yet</div>`; return; }
     el.innerHTML = `<table><thead><tr><th>File</th><th>Size</th><th>Saved</th><th></th></tr></thead><tbody>
       ${job.checkpoints.slice().sort((a, b) => b.mtime - a.mtime).map((c) => `<tr><td class="mono">${esc(c.file)}</td><td class="muted">${fmtBytes(c.size)}</td>
-      <td class="muted">${timeAgo(c.mtime)}</td><td style="text-align:right"><a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}" download>${I.download} Download</a></td></tr>`).join("")}
+      <td class="muted">${timeAgo(c.mtime)}</td><td style="text-align:right"><a class="btn btn-sm" href="#/generate?lora=${enc(`jobs/${name}/checkpoints/${c.file}`)}">${I.spark} Generate</a> <a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}" download>${I.download} Download</a></td></tr>`).join("")}
       </tbody></table><div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">
       LoRA files use ComfyUI-compatible keys (<span class="mono">diffusion_model.layers.N.proj.*</span>). Load with a standard LoraLoaderModelOnly node on top of the MOSS-Image loader, or use <span class="mono">generate.py</span>.</div>`;
   }
@@ -762,6 +766,234 @@ async function pageDataset(name) {
     await guard(() => api(base, { method: "DELETE" }), "Dataset deleted");
     location.hash = "#/datasets";
   };
+}
+
+
+// ------------------------------------------------------------------ generate
+const GEN_KEY = "moss.generate.v1";
+const ASPECTS = [["1:1", 1, 1], ["4:3", 4, 3], ["3:4", 3, 4], ["3:2", 3, 2], ["2:3", 2, 3], ["16:9", 16, 9], ["9:16", 9, 16]];
+const sizeFor = (a, b, mp) => {
+  const area = mp * 1024 * 1024, w = Math.sqrt((area * a) / b);
+  return [Math.round(w / 16) * 16, Math.round(area / w / 16) * 16];
+};
+function loadGenState() { try { return JSON.parse(localStorage.getItem(GEN_KEY)) || {}; } catch { return {}; } }
+function saveGenState(st) { try { localStorage.setItem(GEN_KEY, JSON.stringify(st)); } catch { /* private mode */ } }
+
+async function pageGenerate(params) {
+  if (!INFO) INFO = await api("/api/info");
+  let loras = await api("/api/loras");
+  const defaults = { prompt: "", negative: "", loras: [], aspect: "1:1", mp: 1, width: 1024, height: 1024, steps: 50,
+    cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model };
+  const st = { ...defaults, ...loadGenState() };
+  st.loras = (st.loras || []).filter((l) => loras.some((x) => x.id === l.id));
+  if (params.lora) {
+    const info = loras.find((x) => x.id === params.lora);
+    if (info && !st.loras.some((l) => l.id === info.id)) st.loras.push({ id: info.id, strength: 1 });
+    if (info && info.trigger && !st.prompt.includes(info.trigger)) st.prompt = `${info.trigger}, ${st.prompt}`.replace(/, $/, "");
+    if (info && info.model) st.model = info.model;
+    saveGenState(st);
+    history.replaceState(null, "", "#/generate");
+  }
+  const loraInfo = (id) => loras.find((x) => x.id === id) || { label: id.split("/").pop(), trigger: "" };
+
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Generate</h1><div class="sub">Try your LoRAs with the official MOSS-Image sampler</div></div>
+      <div class="row" id="g-worker"></div></div>
+    <div class="gen-layout">
+      <div class="card gen-controls"><div class="card-body gen-form">
+        <label class="field">Prompt<textarea id="g-prompt" rows="5" placeholder="Describe the image… (⌘/Ctrl + Enter to generate)"></textarea></label>
+        <label class="field">Negative prompt<textarea id="g-negative" rows="2" placeholder="Optional, e.g. worst quality, bad anatomy, watermark"></textarea></label>
+        <div class="field"><div class="row" style="justify-content:space-between"><span>LoRAs</span>
+          <label class="btn btn-sm btn-ghost" style="cursor:pointer" title="Upload a .safetensors LoRA">${I.upload} Upload<input type="file" id="g-upload" accept=".safetensors" multiple hidden></label></div>
+          <div id="g-loras" class="lora-list"></div>
+          <select id="g-add"></select></div>
+        <div class="field">Size
+          <div class="chips" id="g-aspects">${ASPECTS.map(([k]) => `<span class="chip" data-aspect="${k}">${k}</span>`).join("")}</div>
+          <div class="row" style="gap:8px;margin-top:4px;flex-wrap:nowrap">
+            <select id="g-mp" style="width:96px"><option value="1">1 MP</option><option value="1.5">1.5 MP</option><option value="2">2 MP</option></select>
+            <input type="number" id="g-w" step="16" min="256" max="2048"><span class="muted">×</span><input type="number" id="g-h" step="16" min="256" max="2048"></div></div>
+        <div class="gen-nums">
+          <label class="field">Steps<input type="number" id="g-steps" min="1" max="150"></label>
+          <label class="field">CFG<input type="number" id="g-cfg" step="0.1" min="0" max="20"></label>
+          <label class="field">Images<input type="number" id="g-count" min="1" max="8"></label></div>
+        <label class="field">Seed <span class="help">−1 = random each time</span>
+          <div class="row" style="gap:6px;flex-wrap:nowrap"><input type="number" id="g-seed">
+          <button class="btn btn-sm" id="g-random" title="Random">${I.dice}</button></div></label>
+        <details><summary>Advanced</summary><div class="gen-nums" style="margin-top:10px">
+          <label class="field" style="grid-column:1/-1">Base model<select id="g-model">${Object.entries(INFO.models).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join("")}</select></label>
+          <label class="field">Shift<input type="number" id="g-shift" step="0.1"></label>
+          <label class="field">Skip layer<input type="number" id="g-skip" min="-1" max="41" title="Negative-branch layer skip, -1 = off"></label></div></details>
+        <button class="btn btn-primary" id="g-go">${I.spark} Generate</button>
+      </div></div>
+      <div class="gen-results"><div class="card" id="g-status"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
+    </div>`;
+
+  // ---- form <-> state
+  const fields = { prompt: "#g-prompt", negative: "#g-negative", width: "#g-w", height: "#g-h", steps: "#g-steps", cfg: "#g-cfg",
+    count: "#g-count", seed: "#g-seed", shift: "#g-shift", skip_layer: "#g-skip", model: "#g-model", mp: "#g-mp" };
+  const numeric = new Set(["width", "height", "steps", "cfg", "count", "seed", "shift", "skip_layer", "mp"]);
+  for (const [k, sel] of Object.entries(fields)) $(sel).value = st[k];
+  const syncAspect = () => $$("#g-aspects .chip").forEach((c) => c.classList.toggle("on", c.dataset.aspect === st.aspect));
+  syncAspect();
+  const applyAspect = () => {
+    const a = ASPECTS.find(([k]) => k === st.aspect);
+    if (!a) return;
+    [st.width, st.height] = sizeFor(a[1], a[2], +st.mp);
+    $("#g-w").value = st.width; $("#g-h").value = st.height;
+  };
+  view.addEventListener("input", (e) => {
+    const k = Object.keys(fields).find((key) => e.target.matches(fields[key]));
+    if (!k) return;
+    st[k] = numeric.has(k) ? Number(e.target.value) : e.target.value;
+    if (k === "width" || k === "height") { st.aspect = ""; syncAspect(); }
+    if (k === "mp") applyAspect();
+    saveGenState(st);
+  });
+  $("#g-model").onchange = (e) => { st.model = e.target.value; saveGenState(st); };
+  $("#g-mp").onchange = (e) => { st.mp = +e.target.value; applyAspect(); saveGenState(st); };
+  $("#g-aspects").onclick = (e) => {
+    const c = e.target.closest("[data-aspect]");
+    if (!c) return;
+    st.aspect = c.dataset.aspect; syncAspect(); applyAspect(); saveGenState(st);
+  };
+  $("#g-random").onclick = (e) => { e.preventDefault(); st.seed = -1; $("#g-seed").value = -1; saveGenState(st); };
+
+  // ---- LoRA list
+  function renderLoras() {
+    $("#g-loras").innerHTML = st.loras.length ? st.loras.map((l, i) => {
+      const info = loraInfo(l.id);
+      return `<div class="lora-row" data-i="${i}">
+        <div class="lora-name" title="${esc(l.id)}">${esc(info.label)}${info.trigger ? `<span class="faint"> · ${esc(info.trigger)}</span>` : ""}</div>
+        <input type="range" min="-1" max="2" step="0.05" value="${l.strength}" data-strength>
+        <input type="number" step="0.05" value="${l.strength}" data-strength-num>
+        ${info.trigger ? `<button class="btn btn-sm btn-ghost" data-trigger title="Add trigger word to prompt">T</button>` : "<span></span>"}
+        <button class="btn btn-sm btn-ghost" data-remove title="Remove">${I.x}</button></div>`;
+    }).join("") : `<div class="faint" style="font-size:12px">No LoRA, base model only</div>`;
+    const groups = {};
+    loras.filter((x) => !st.loras.some((l) => l.id === x.id)).forEach((x) => (groups[x.group] = groups[x.group] || []).push(x));
+    $("#g-add").innerHTML = `<option value="">${loras.length ? "+ Add a LoRA…" : "No LoRAs yet: train one first"}</option>` +
+      Object.entries(groups).map(([g, xs]) => `<optgroup label="${esc(g)}">${xs.map((x) => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join("")}</optgroup>`).join("");
+  }
+  renderLoras();
+  $("#g-add").onchange = (e) => {
+    if (!e.target.value) return;
+    st.loras.push({ id: e.target.value, strength: 1 });
+    saveGenState(st); renderLoras();
+  };
+  $("#g-loras").addEventListener("input", (e) => {
+    const row = e.target.closest(".lora-row");
+    if (!row) return;
+    const l = st.loras[+row.dataset.i], v = Number(e.target.value);
+    if (!isFinite(v)) return;
+    l.strength = v;
+    if (e.target.matches("[data-strength]")) $("[data-strength-num]", row).value = v;
+    else $("[data-strength]", row).value = v;
+    saveGenState(st);
+  });
+  $("#g-loras").addEventListener("click", (e) => {
+    const row = e.target.closest(".lora-row");
+    if (!row) return;
+    const l = st.loras[+row.dataset.i];
+    if (e.target.closest("[data-remove]")) { st.loras.splice(+row.dataset.i, 1); saveGenState(st); renderLoras(); }
+    if (e.target.closest("[data-trigger]")) {
+      const t = loraInfo(l.id).trigger;
+      if (!st.prompt.includes(t)) { st.prompt = st.prompt ? `${t}, ${st.prompt}` : t; $("#g-prompt").value = st.prompt; saveGenState(st); }
+    }
+  });
+  $("#g-upload").onchange = async (e) => {
+    const fd = new FormData();
+    [...e.target.files].forEach((f) => fd.append("files", f));
+    if (!e.target.files.length) return;
+    toast("Uploading LoRA…");
+    const r = await guard(() => api("/api/loras/upload", { method: "POST", body: fd }));
+    loras = await api("/api/loras");
+    r.added.forEach((f) => st.loras.push({ id: `loras/${f}`, strength: 1 }));
+    saveGenState(st); renderLoras();
+    toast(`Added ${r.added.join(", ")}`, "ok");
+  };
+
+  // ---- submit
+  async function submit() {
+    const body = { ...st, loras: st.loras.map((l) => ({ id: l.id, strength: l.strength, name: loraInfo(l.id).label })) };
+    await guard(() => api("/api/generate", { method: "POST", body }));
+    refreshStatus();
+  }
+  $("#g-go").onclick = submit;
+  $("#g-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); } });
+
+  // ---- status
+  const W_LABEL = { unloaded: "Model not loaded", starting: "Starting", loading: "Loading model", idle: "Starting", ready: "Model ready", generating: "Generating", exiting: "Unloading" };
+  async function refreshStatus() {
+    const g = await api("/api/generate/status");
+    const busy = g.current || g.queue.length;
+    $("#g-worker").innerHTML = `<span class="badge ${g.state === "ready" ? "done" : g.state === "unloaded" ? "" : "running"}">${esc(W_LABEL[g.state] || g.state)}${g.model ? ` · ${esc(g.model.split("/").pop())}` : ""}</span>
+      ${g.state !== "unloaded" ? `<button class="btn btn-sm btn-ghost" id="g-unload" title="Free GPU memory">Unload</button>` : ""}`;
+    let html = "";
+    if (g.current) {
+      const p = g.current.progress;
+      const frac = p ? (p.image + p.step / p.steps) / p.count : 0;
+      html += `<div class="card-body"><div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(g.current.prompt)}</div>
+        <button class="btn btn-sm" data-cancel="${esc(g.current.id)}">${I.stop} Cancel</button></div>
+        <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
+        <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}` : esc(g.message || "Preparing…")}</div></div>`;
+    }
+    if (g.queue.length) html += `<div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">${g.queue.length} more queued</div>`;
+    if (g.training && busy) html += `<div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">A training job is running, so the text encoder stays off the GPU and new prompts encode a little slower.</div>`;
+    if (g.last_error) html += `<div class="card-body" style="color:var(--red);font-size:13px;border-top:1px solid var(--border)">${esc(g.last_error)}</div>`;
+    if (!html) html = `<div class="card-body faint" style="font-size:13px">${g.state === "unloaded" ? "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes." : "Ready. Write a prompt and hit Generate."}</div>`;
+    $("#g-status").innerHTML = html;
+    if (g.version !== lastVersion) { lastVersion = g.version; loadGallery(); }
+  }
+  $("#g-status").onclick = async (e) => {
+    const c = e.target.closest("[data-cancel]");
+    if (c) { await guard(() => api(`/api/generate/cancel/${enc(c.dataset.cancel)}`, { method: "POST" })); refreshStatus(); }
+  };
+  $("#g-worker").onclick = async (e) => {
+    if (e.target.closest("#g-unload")) { await guard(() => api("/api/generate/unload", { method: "POST" }), "Model unloaded"); refreshStatus(); }
+  };
+
+  // ---- gallery
+  let items = [], lastVersion = null, limit = 60;
+  const fileUrl = (f) => `/api/generations/file/${enc(f)}`;
+  const describe = (it) => [`seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
+    ...(it.loras || []).map((l) => `${l.name} @ ${l.strength}`)].join(" · ");
+  async function loadGallery() {
+    const r = await api(`/api/generations?limit=${limit}`);
+    items = r.items;
+    $("#g-gallery").innerHTML = items.length ? items.map((it, i) => `
+      <div class="gen-card" data-i="${i}">
+        <img loading="lazy" src="${fileUrl(it.thumb)}" style="aspect-ratio:${it.width}/${it.height}" data-open="${i}">
+        <div class="gen-ov"><div class="gen-ov-text">${esc(it.prompt)}</div><div class="row" style="gap:4px;flex-wrap:nowrap">
+          <button class="btn btn-sm" data-reuse="${i}" title="Use these settings">${I.reuse}</button>
+          <a class="btn btn-sm" href="${fileUrl(it.file)}" download title="Download PNG">${I.download}</a>
+          <button class="btn btn-sm btn-danger" data-del="${i}" title="Delete">${I.trash}</button></div></div></div>`).join("")
+      : `<div class="card empty" style="grid-column:1/-1">${I.image}<div>Generated images will show up here</div></div>`;
+    $("#g-more").innerHTML = r.total > items.length ? `<div style="text-align:center;margin-top:14px"><button class="btn" id="g-load-more">Show more (${r.total - items.length})</button></div>` : "";
+  }
+  $("#g-more").onclick = (e) => { if (e.target.closest("#g-load-more")) { limit += 60; loadGallery(); } };
+  $("#g-gallery").addEventListener("click", async (e) => {
+    const open = e.target.closest("[data-open]"), reuse = e.target.closest("[data-reuse]"), del = e.target.closest("[data-del]");
+    if (open) lightbox(items.map((it) => ({ src: fileUrl(it.file), title: describe(it), caption: it.prompt })), +open.dataset.open);
+    if (reuse) {
+      const it = items[+reuse.dataset.reuse];
+      Object.assign(st, { prompt: it.prompt, negative: it.negative || "", width: it.width, height: it.height, steps: it.steps,
+        cfg: it.cfg, shift: it.shift ?? 5, skip_layer: it.skip_layer ?? 22, seed: it.seed, model: it.model || st.model, aspect: "",
+        loras: (it.loras || []).filter((l) => loras.some((x) => x.id === l.path)).map((l) => ({ id: l.path, strength: l.strength })) });
+      saveGenState(st);
+      for (const [k, sel] of Object.entries(fields)) if (k !== "mp") $(sel).value = st[k];
+      syncAspect(); renderLoras();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      toast("Settings loaded (same seed)", "ok");
+    }
+    if (del) {
+      if (!(await confirmBox("Delete image?", "This permanently deletes the image."))) return;
+      await guard(() => api(`/api/generations/${enc(items[+del.dataset.del].file)}`, { method: "DELETE" }));
+      loadGallery();
+    }
+  });
+
+  every(refreshStatus, 1500);
 }
 
 // ------------------------------------------------------------------ boot
