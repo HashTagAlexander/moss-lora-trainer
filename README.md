@@ -1,0 +1,96 @@
+# MOSS Trainer — LoRA training for MOSS-Image
+
+A self-hosted web UI (in the spirit of ai-toolkit) for training LoRAs on
+[OpenMOSS MOSS-Image](https://github.com/OpenMOSS/MOSS-Image), a 5B single-stream DiT
+with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
+
+- **Datasets**: drag-and-drop images / `.txt` captions / `.zip`, inline caption editor, bulk prepend/append/replace.
+- **Jobs**: form or raw-JSON config, GPU queue, live loss chart, sample grid per step, log viewer,
+  stop (saves a checkpoint first), resume, "train more", clone, reset.
+- **Output**: `.safetensors` LoRAs with ComfyUI-style keys (`diffusion_model.layers.N.proj.q.lora_A.weight`, …).
+
+## How training works
+
+| | |
+|---|---|
+| Trainable | LoRA on the 42 main DiT blocks: attention `q/k/v/o`, gated FFN `ffn_up_gate/ffn_down` (optionally the 2 text-refiner blocks) |
+| Frozen | Everything else. The Qwen3.5-9B text encoder is never trained, as the MOSS authors recommend |
+| Objective | Rectified flow: `x_t = (1-σ)·x0 + σ·ε`, predict `ε − x0`, plain MSE, timestep `1000·σ` (same as pretraining) |
+| Timesteps | Default `moss` = the final pretraining stage's truncated logit-normal (tech report, Table 6). Logit-normal / shifted / uniform are also available |
+| Caching | Captions are encoded once with Qwen3.5-9B and cached on disk. The encoder is then unloaded. Images are VAE-encoded once per aspect bucket |
+| Sampling | The official recipe: Euler, shift 5, CFG 3, negative-branch layer skip at block 22 |
+
+The transformer code is vendored from the model's `pipeline_moss_image.py` (Apache-2.0) with
+gradient checkpointing added. Its outputs match the original bit-for-bit.
+
+## vast.ai template (recommended)
+
+Put this code in a GitHub repo, then create a vast.ai template that installs and starts everything on
+first boot. Full field-by-field settings are in **[vast/TEMPLATE.md](vast/TEMPLATE.md)**. After that,
+renting an instance with the template is all it takes: open **Open → MOSS Trainer** once
+`moss-setup.log` says it's finished.
+
+## vast.ai manual setup (RTX PRO 6000, port 9090)
+
+1. **Rent the instance**
+   - GPU: RTX PRO 6000 (96 GB). Disk: **≥ 120 GB** (the weights are about 30 GB, plus cache and checkpoints).
+   - Template: any PyTorch / CUDA **12.8+** Ubuntu image (for example the official *PyTorch* template).
+   - In the template's *Docker options*, add: `-p 9090:9090`
+2. **Copy this folder to the instance**, for example:
+   ```bash
+   rsync -avz -e "ssh -p <SSH_PORT>" --exclude workspace --exclude .venv ./ root@<SSH_HOST>:/workspace/loratrainer/
+   ```
+3. **Run setup** on the instance:
+   ```bash
+   cd /workspace/loratrainer && bash setup.sh
+   ```
+   This installs uv, a Python 3.12 venv, PyTorch (cu128 wheels for Blackwell) and the dependencies. It
+   then downloads MOSS-Image-Base and starts the UI in a tmux session on port **9090**. At the end it
+   prints the URL and a generated password (user `admin`).
+4. **Open the UI.** On vast.ai, port 9090 is mapped to a random external port: see *IP Port Info* on
+   the instance card. Alternatively, use an SSH tunnel:
+   ```bash
+   ssh -p <SSH_PORT> root@<SSH_HOST> -L 9090:localhost:9090
+   ```
+   Then browse to http://localhost:9090.
+5. *(Optional)* To restart the UI automatically after a reboot, set the instance's **on-start script** to
+   `bash /workspace/loratrainer/start.sh`.
+
+Useful setup options: `HF_TOKEN=hf_... bash setup.sh`, `MODELS="OpenMOSS-Team/MOSS-Image-Base OpenMOSS-Team/MOSS-Image-SFT" bash setup.sh`,
+`NO_AUTH=1` (only behind an SSH tunnel), `TORCH_INDEX=https://download.pytorch.org/whl/cu130`.
+
+Everything persistent lives under `/workspace/moss_workspace/` (datasets, jobs, caches) and
+`/workspace/hf_cache/` (model weights).
+
+## Workflow
+
+1. **Datasets → New dataset**, then drop in images. Captions pair with images by filename (`foo.jpg` + `foo.txt`).
+   MOSS-Image was trained on rich natural-language captions (short, medium and long), so describe each image properly
+   rather than only listing tags. Put `[trigger]` in a caption to control where the trigger word goes; otherwise it is prepended.
+2. **New Job**: pick the dataset, set a trigger word and adjust the settings. **Save & start**.
+3. Watch the loss and samples on the job page. **Stop** saves a checkpoint, and **Start** resumes from it.
+4. Download LoRAs from the **Checkpoints** tab.
+
+Starting points: rank 32 / alpha 32, AdamW at 1e-4, 1500–3000 steps for 20–50 images, 1024 resolution.
+With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 25% more speed.
+
+## Using the LoRA
+
+- **ComfyUI**: install the MOSS-Image ComfyUI plugin from the MOSS-Image repo, load the model with its loader, then
+  apply the LoRA with a standard `LoraLoaderModelOnly` node.
+- **Diffusers / CLI**:
+  ```bash
+  python generate.py --lora workspace/jobs/my_lora/checkpoints/my_lora.safetensors \
+      --prompt "mytrigger, a portrait photo by a window" --steps 50 --out test.png
+  ```
+  Use `--lora path.safetensors:0.8` to set the strength. Repeat `--lora` to stack several LoRAs.
+
+## Development
+
+```bash
+python tests/smoke_test.py      # tiny random model on CPU: caching, training, sampling, save, resume
+python -m server.app --port 9090
+```
+
+Layout: `mosstrainer/` (model, LoRA, data, trainer process), `server/` (FastAPI and a static UI with no build step),
+`setup.sh` / `start.sh` (deployment).

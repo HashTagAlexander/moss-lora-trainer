@@ -1,0 +1,10 @@
+.venv/
+workspace/
+moss_workspace/
+hf_cache/
+.password
+start.sh
+__pycache__/
+*.pyc
+.DS_Store
+Screenshot*.png

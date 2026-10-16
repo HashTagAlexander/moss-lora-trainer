@@ -1,0 +1,13 @@
+# torch is installed separately by setup.sh (CUDA 12.8+ wheels for Blackwell / RTX PRO 6000)
+diffusers>=0.38
+transformers>=5.3
+accelerate>=1.10
+safetensors>=0.6
+huggingface_hub[hf_xet]>=0.34
+Pillow>=10
+numpy
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+bitsandbytes>=0.45
+prodigyopt>=1.1
