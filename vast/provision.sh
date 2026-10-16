@@ -3,7 +3,7 @@
 # Point the template's PROVISIONING_SCRIPT variable at the raw URL of this file.
 #
 # Template variables it reads:
-#   MOSS_TRAINER_REPO      git URL of the trainer (required unless the default below is filled in)
+#   MOSS_TRAINER_REPO      git URL of the trainer (default: github.com/HashTagAlexander/moss-lora-trainer)
 #   MOSS_TRAINER_BRANCH    branch to check out (default: main)
 #   MOSS_TRAINER_PASSWORD  UI password (otherwise generated; see /workspace/loratrainer/.password)
 #   HF_TOKEN, MODELS, PORT  passed through to setup.sh
@@ -11,7 +11,7 @@
 # Progress appears on the Instance Portal's Logs page (moss-setup.log).
 set -o pipefail
 
-REPO="${MOSS_TRAINER_REPO:-}"
+REPO="${MOSS_TRAINER_REPO:-https://github.com/HashTagAlexander/moss-lora-trainer.git}"
 BRANCH="${MOSS_TRAINER_BRANCH:-main}"
 DIR=/workspace/loratrainer
 LOG=/var/log/portal/moss-setup.log

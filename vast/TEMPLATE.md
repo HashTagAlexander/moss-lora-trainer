@@ -3,8 +3,6 @@
 A template that installs and starts the trainer on its own. Rent an instance, wait for setup
 to finish, then click **Open → MOSS Trainer**.
 
-Replace `<USER>/<REPO>` everywhere below with the GitHub repo that holds this code.
-
 ## Create the template
 
 vast.ai console → **Templates** → **New Template** (or **+ Create**), then fill in:
@@ -21,7 +19,7 @@ vast.ai console → **Templates** → **New Template** (or **+ Create**), then f
 **Docker options**: paste this as one line:
 
 ```
--p 1111:1111 -p 6006:6006 -p 8080:8080 -p 8384:8384 -p 9090:9090 -e OPEN_BUTTON_PORT=1111 -e OPEN_BUTTON_TOKEN=1 -e JUPYTER_DIR=/ -e DATA_DIRECTORY=/workspace/ -e PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal|localhost:8384:18384:/:Syncthing|localhost:6006:16006:/:Tensorboard|localhost:9090:9090:/:MOSS Trainer" -e PROVISIONING_SCRIPT=https://raw.githubusercontent.com/<USER>/<REPO>/main/vast/provision.sh -e MOSS_TRAINER_REPO=https://github.com/<USER>/<REPO>.git -e NVIDIA_DRIVER_CAPABILITIES=all
+-p 1111:1111 -p 6006:6006 -p 8080:8080 -p 8384:8384 -p 9090:9090 -e OPEN_BUTTON_PORT=1111 -e OPEN_BUTTON_TOKEN=1 -e JUPYTER_DIR=/ -e DATA_DIRECTORY=/workspace/ -e PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal|localhost:8384:18384:/:Syncthing|localhost:6006:16006:/:Tensorboard|localhost:9090:9090:/:MOSS Trainer" -e PROVISIONING_SCRIPT=https://raw.githubusercontent.com/HashTagAlexander/moss-lora-trainer/main/vast/provision.sh -e MOSS_TRAINER_REPO=https://github.com/HashTagAlexander/moss-lora-trainer.git -e NVIDIA_DRIVER_CAPABILITIES=all
 ```
 
 If you'd rather use the **Environment Variables** section, enter the same variables there. Wrap
