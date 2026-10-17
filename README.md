@@ -9,6 +9,23 @@ with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
   stop (saves a checkpoint first), resume, "train more", clone, reset.
 - **Output**: `.safetensors` LoRAs with ComfyUI-style keys (`diffusion_model.layers.N.proj.q.lora_A.weight`, …).
 
+## Supported models
+
+| Model id | Family | Train | Notes |
+|---|---|---|---|
+| `OpenMOSS-Team/MOSS-Image-Base` | MOSS-Image | ✓ | recommended MOSS base for LoRAs |
+| `OpenMOSS-Team/MOSS-Image-SFT` | MOSS-Image | ✓ | |
+| `kroma-v0.3-teacher` | Krea 2 | ✓ | [lodestones/Kroma](https://huggingface.co/lodestones/Kroma) teacher (velocity), recommended Kroma base for LoRAs |
+| `kroma-v0.3-base` | Krea 2 | ✓ | stored in fp32 (~51 GB download), loaded as bf16 |
+| `kroma-v0.3.1-turbo` | Krea 2 | generate only | 8 steps, CFG 1, shift 1.15. LoRAs trained on the teacher work on it |
+| `krea2-raw`, `krea2-turbo` | Krea 2 | raw ✓ / turbo generate only | from Comfy-Org/Krea-2 |
+
+Krea 2 models use diffusers' `Krea2Transformer2DModel` with the public Qwen3-VL-4B-Instruct text encoder and the
+Qwen-Image VAE (both byte-identical to what Krea 2 ships). Kroma LoRAs are saved in diffusers format
+(`transformer.transformer_blocks.N.attn.to_q.lora_A.weight`), which loads in diffusers' `Krea2Pipeline` and in
+ComfyUI. Sampling CFG uses the standard convention (1 = off), so Krea's "guidance 4.5" is CFG 5.5 here. Shift 0
+means the resolution-aware default.
+
 ## How training works
 
 | | |
@@ -93,7 +110,8 @@ With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 2
 ## Development
 
 ```bash
-python tests/smoke_test.py      # tiny random model on CPU: caching, training, sampling, save, resume
+python tests/smoke_test.py        # tiny random MOSS model on CPU: caching, training, sampling, save, resume
+python tests/smoke_test_krea2.py  # tiny random Krea 2 stack, checked against diffusers' Krea2Pipeline
 python -m server.app --port 9090
 ```
 

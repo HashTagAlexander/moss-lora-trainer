@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from mosstrainer.config import DEFAULTS, MODELS, NAME_RE, validate  # noqa: E402
+from mosstrainer.config import DEFAULTS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE, validate  # noqa: E402
 
 WORKSPACE = Path(os.environ.get("MOSS_WORKSPACE", ROOT / "workspace")).resolve()
 DATASETS = WORKSPACE / "datasets"
@@ -330,7 +330,10 @@ gen_manager = GenManager()
 
 @app.get("/api/info")
 def info():
-    return {"defaults": DEFAULTS, "models": MODELS, "workspace": str(WORKSPACE), "auth": bool(PASSWORD)}
+    specs = {k: {"label": v["label"], "family": v["family"], "trainable": bool(v.get("trainable")),
+                 "defaults": v.get("defaults", {})} for k, v in MODEL_SPECS.items()}
+    return {"defaults": DEFAULTS, "models": MODELS, "trainable": TRAINABLE, "model_specs": specs,
+            "workspace": str(WORKSPACE), "auth": bool(PASSWORD)}
 
 
 @app.get("/api/gpu")
@@ -686,12 +689,13 @@ def lora_inventory():
         for p in sorted(ck.glob("*.safetensors"), key=lambda p: p.stat().st_mtime, reverse=True):
             stem = p.stem
             step = stem.rsplit("_", 1)[-1] if stem != cfg.get("name") else str(cfg.get("train", {}).get("steps", ""))
-            out.append({"id": f"jobs/{d.name}/checkpoints/{p.name}", "file": p.name, "group": d.name,
+            family = MODEL_SPECS.get(cfg.get("model"), {}).get("family")
+            out.append({"id": f"jobs/{d.name}/checkpoints/{p.name}", "file": p.name, "group": d.name, "family": family,
                         "label": f"{d.name} · {'final' if stem == cfg.get('name') else 'step ' + step.lstrip('0')}",
                         "trigger": cfg.get("trigger_word", ""), "model": cfg.get("model"),
                         "mtime": p.stat().st_mtime, "size": p.stat().st_size})
     for p in sorted(LORAS.glob("*.safetensors")):
-        out.append({"id": f"loras/{p.name}", "file": p.name, "group": "Uploaded", "label": p.stem, "trigger": "",
+        out.append({"id": f"loras/{p.name}", "file": p.name, "group": "Uploaded", "label": p.stem, "trigger": "", "family": None,
                     "model": None, "mtime": p.stat().st_mtime, "size": p.stat().st_size})
     return out
 
@@ -736,20 +740,21 @@ async def generate(request: Request):
     prompt = str(body.get("prompt", "")).strip()
     if not prompt:
         raise HTTPException(400, "Write a prompt first")
+    model = body.get("model") or DEFAULTS["model"]
+    if model not in MODEL_SPECS:
+        raise HTTPException(400, "Unknown model")
+    d = MODEL_SPECS[model].get("defaults", {})
     try:
         width, height = int(body.get("width", 1024)), int(body.get("height", 1024))
-        steps, count = int(body.get("steps", 50)), int(body.get("count", 1))
-        cfg, shift = float(body.get("cfg", 3.0)), float(body.get("shift", 5.0))
-        seed, skip = int(body.get("seed", -1)), int(body.get("skip_layer", 22))
+        steps, count = int(body.get("steps", d.get("steps", 30))), int(body.get("count", 1))
+        cfg, shift = float(body.get("cfg", d.get("cfg", 3.0))), float(body.get("shift", d.get("shift", 0.0)))
+        seed, skip = int(body.get("seed", -1)), int(body.get("skip_layer", d.get("skip_layer", -1)))
     except (TypeError, ValueError):
         raise HTTPException(400, "Invalid number in settings")
     if not (256 <= width <= 2048 and 256 <= height <= 2048):
         raise HTTPException(400, "Width and height must be between 256 and 2048")
     if not 1 <= steps <= 150 or not 1 <= count <= 8:
         raise HTTPException(400, "Steps must be 1-150 and count 1-8")
-    model = body.get("model") or DEFAULTS["model"]
-    if model not in MODELS and not Path(model).is_dir():
-        raise HTTPException(400, "Unknown model")
     loras = []
     for lr in body.get("loras", []) or []:
         path = resolve_lora(str(lr.get("id", "")))

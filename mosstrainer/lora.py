@@ -1,7 +1,9 @@
-"""Minimal LoRA for MOSS-Image, saved in a ComfyUI-loadable format.
+"""Minimal LoRA for MOSS-Image and Krea 2, saved in ComfyUI/diffusers-loadable formats.
 
-Keys look like ``diffusion_model.layers.0.proj.q.lora_A.weight`` / ``lora_B.weight`` / ``alpha``,
+MOSS-Image ("moss" format): ``diffusion_model.layers.0.proj.q.lora_A.weight`` / ``lora_B.weight`` / ``alpha``,
 which ComfyUI's generic LoRA loader maps onto the MOSS-Image diffusion model.
+Krea 2 ("diffusers" format): ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight`` / ``lora_B.weight``
+with alpha/rank folded into lora_B, loadable by diffusers' Krea2Pipeline and ComfyUI.
 """
 from __future__ import annotations
 
@@ -49,28 +51,36 @@ class LoRALinear(nn.Module):
         return out + (delta * (self.scale * self.multiplier)).to(out.dtype)
 
 
-def _layer_index(name):
-    m = re.match(r"^layers\.(\d+)\.", name)
+def _layer_index(name, layer_re=r"^layers\.(\d+)\."):
+    m = re.match(layer_re, name)
     return int(m.group(1)) if m else None
 
 
+def _replace(model: nn.Module, name: str, new: nn.Module):
+    parent_name, _, child = name.rpartition(".")
+    parent = model.get_submodule(parent_name) if parent_name else model
+    if isinstance(parent, nn.ModuleDict):
+        parent[child] = new
+    elif isinstance(parent, (nn.ModuleList, nn.Sequential)) and child.isdigit():
+        parent[int(child)] = new
+    else:
+        setattr(parent, child, new)
+
+
 def inject(model: nn.Module, rank: int, alpha: float, targets=("attn", "ffn"), dropout=0.0,
-           layers: list[int] | None = None) -> dict[str, LoRALinear]:
-    patterns = [re.compile(TARGETS[t]) for t in targets]
+           layers: list[int] | None = None, target_map: dict[str, str] | None = None,
+           layer_re: str = r"^layers\.(\d+)\.") -> dict[str, LoRALinear]:
+    target_map = target_map or TARGETS
+    patterns = [re.compile(target_map[t]) for t in targets]
     found = {}
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear) or not any(p.match(name) for p in patterns):
             continue
-        idx = _layer_index(name)
+        idx = _layer_index(name, layer_re)
         if layers is not None and idx is not None and idx not in layers:
             continue
-        parent_name, _, child = name.rpartition(".")
-        parent = model.get_submodule(parent_name)
         wrapped = LoRALinear(module, rank, alpha, dropout)
-        if isinstance(parent, nn.ModuleDict):
-            parent[child] = wrapped
-        else:
-            setattr(parent, child, wrapped)
+        _replace(model, name, wrapped)
         found[name] = wrapped
     if not found:
         raise ValueError(f"No LoRA targets matched {targets}")
@@ -88,20 +98,27 @@ def parameters(modules: dict[str, LoRALinear]):
         yield m.lora_B.weight
 
 
-def state_dict(modules: dict[str, LoRALinear], dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
+def state_dict(modules: dict[str, LoRALinear], dtype=torch.bfloat16, fmt: str = "moss") -> dict[str, torch.Tensor]:
     sd = {}
     for name, m in modules.items():
-        sd[f"{PREFIX}{name}.lora_A.weight"] = m.lora_A.weight.detach().to("cpu", dtype).contiguous()
-        sd[f"{PREFIX}{name}.lora_B.weight"] = m.lora_B.weight.detach().to("cpu", dtype).contiguous()
-        sd[f"{PREFIX}{name}.alpha"] = torch.tensor(float(m.alpha))
+        a = m.lora_A.weight.detach().float()
+        b = m.lora_B.weight.detach().float()
+        if fmt == "diffusers":  # no alpha keys: fold alpha/rank into B so every loader gets the same delta
+            sd[f"transformer.{name}.lora_A.weight"] = a.to("cpu", dtype).contiguous()
+            sd[f"transformer.{name}.lora_B.weight"] = (b * m.scale).to("cpu", dtype).contiguous()
+        else:
+            sd[f"{PREFIX}{name}.lora_A.weight"] = a.to("cpu", dtype).contiguous()
+            sd[f"{PREFIX}{name}.lora_B.weight"] = b.to("cpu", dtype).contiguous()
+            sd[f"{PREFIX}{name}.alpha"] = torch.tensor(float(m.alpha))
     return sd
 
 
-def save(modules, path, metadata: dict | None = None, dtype=torch.bfloat16):
-    meta = {"format": "pt", "modelspec.architecture": "moss-image/lora"}
+def save(modules, path, metadata: dict | None = None, dtype=torch.bfloat16, fmt: str = "moss"):
+    arch = "krea2/lora" if fmt == "diffusers" else "moss-image/lora"
+    meta = {"format": "pt", "modelspec.architecture": arch}
     for k, v in (metadata or {}).items():
         meta[k] = v if isinstance(v, str) else json.dumps(v)
-    save_file(state_dict(modules, dtype), str(path), metadata=meta)
+    save_file(state_dict(modules, dtype, fmt), str(path), metadata=meta)
 
 
 def load_into(modules: dict[str, LoRALinear], path):
@@ -154,7 +171,7 @@ def read_lora_file(path) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
             alpha = sd.get(name + ".alpha")
             rank = a.shape[0]
             scale = (float(alpha) / rank) if alpha is not None else 1.0
-            for prefix in (PREFIX, "transformer.", "model.diffusion_model."):
+            for prefix in ("model.diffusion_model.", PREFIX, "transformer.", "base_model.model."):
                 if name.startswith(prefix):
                     name = name[len(prefix):]
                     break
@@ -184,8 +201,9 @@ class DynamicLoRALinear(nn.Module):
 class LoRAStack:
     """Activates a set of LoRA files with strengths on a transformer; switching is instant and exact."""
 
-    def __init__(self, model: nn.Module, max_cached: int = 8):
+    def __init__(self, model: nn.Module, max_cached: int = 8, name_map=None):
         self.model = model
+        self.name_map = name_map or (lambda n: n)
         self.wrapped: dict[str, DynamicLoRALinear] = {}
         self.cache: dict[tuple, dict] = {}
         self.max_cached = max_cached
@@ -201,13 +219,8 @@ class LoRAStack:
             return module
         if not isinstance(module, nn.Linear):
             return None
-        parent_name, _, child = name.rpartition(".")
-        parent = self.model.get_submodule(parent_name) if parent_name else self.model
         wrapped = DynamicLoRALinear(module)
-        if isinstance(parent, nn.ModuleDict):
-            parent[child] = wrapped
-        else:
-            setattr(parent, child, wrapped)
+        _replace(self.model, name, wrapped)
         self.wrapped[name] = wrapped
         return wrapped
 
@@ -225,7 +238,7 @@ class LoRAStack:
             if key not in self.cache:
                 if len(self.cache) >= self.max_cached:
                     self.cache.pop(next(iter(self.cache)))
-                self.cache[key] = {n: (a.to(device, dtype), b.to(device, dtype), s)
+                self.cache[key] = {self.name_map(n): (a.to(device, dtype), b.to(device, dtype), s)
                                    for n, (a, b, s) in read_lora_file(p).items()}
             miss = 0
             for name, (a, b, scale) in self.cache[key].items():

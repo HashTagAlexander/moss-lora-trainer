@@ -6,10 +6,58 @@ import re
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
-MODELS = {
-    "OpenMOSS-Team/MOSS-Image-Base": "MOSS-Image Base (recommended for LoRA)",
-    "OpenMOSS-Team/MOSS-Image-SFT": "MOSS-Image SFT",
+import json
+import os
+
+# Every model the trainer knows. "family" selects the backend in mosstrainer/backends.py;
+# "defaults" are the recommended sampling settings (cfg uses the standard convention: 1 = off).
+_KROMA = "lodestones/Kroma"
+_KREA_TE = "Qwen/Qwen3-VL-4B-Instruct"   # byte-identical to the encoder Krea 2 ships
+_KREA_VAE = "Qwen/Qwen-Image"            # byte-identical to the Krea 2 VAE
+_MOSS_DEFAULTS = {"steps": 30, "cfg": 3.0, "shift": 5.0, "skip_layer": 22, "timestep_sampling": "moss"}
+_KREA_DEFAULTS = {"steps": 28, "cfg": 5.5, "shift": 0.0, "skip_layer": -1, "timestep_sampling": "flux_shift"}
+_KREA_TURBO_DEFAULTS = {"steps": 8, "cfg": 1.0, "shift": 1.15, "skip_layer": -1, "timestep_sampling": "flux_shift"}
+
+MODEL_SPECS = {
+    "OpenMOSS-Team/MOSS-Image-Base": {
+        "label": "MOSS-Image Base (recommended for LoRA)", "family": "moss", "trainable": True,
+        "defaults": _MOSS_DEFAULTS},
+    "OpenMOSS-Team/MOSS-Image-SFT": {
+        "label": "MOSS-Image SFT", "family": "moss", "trainable": True, "defaults": _MOSS_DEFAULTS},
+    "kroma-v0.3-teacher": {
+        "label": "Kroma v0.3 teacher (Krea 2, recommended for LoRA)", "family": "krea2", "trainable": True,
+        "repo": _KROMA, "file": "kroma-sensei-booru-e6-teacher-velocity-v0.3.safetensors",
+        "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_DEFAULTS},
+    "kroma-v0.3-base": {
+        "label": "Kroma v0.3 base (Krea 2)", "family": "krea2", "trainable": True,
+        "repo": _KROMA, "file": "kroma-v0.3-base.safetensors",
+        "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_DEFAULTS},
+    "kroma-v0.3.1-turbo": {
+        "label": "Kroma v0.3.1 Turbo OPD (Krea 2, generation only)", "family": "krea2", "trainable": False,
+        "repo": _KROMA, "file": "kroma-v0.3.1-turbo-opd.safetensors",
+        "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_TURBO_DEFAULTS},
+    "krea2-raw": {
+        "label": "Krea 2 Raw", "family": "krea2", "trainable": True,
+        "repo": "Comfy-Org/Krea-2", "file": "diffusion_models/krea2_raw_bf16.safetensors",
+        "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_DEFAULTS},
+    "krea2-turbo": {
+        "label": "Krea 2 Turbo (generation only)", "family": "krea2", "trainable": False,
+        "repo": "Comfy-Org/Krea-2", "file": "diffusion_models/krea2_turbo_bf16.safetensors",
+        "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_TURBO_DEFAULTS},
 }
+
+# Extra models (local paths etc.) can be registered from a JSON file, e.g. for tests.
+if os.environ.get("MOSS_EXTRA_MODELS"):
+    MODEL_SPECS.update(json.loads(open(os.environ["MOSS_EXTRA_MODELS"]).read()))
+
+MODELS = {k: v["label"] for k, v in MODEL_SPECS.items()}
+TRAINABLE = {k: v["label"] for k, v in MODEL_SPECS.items() if v.get("trainable")}
+
+
+def model_spec(model_id: str) -> dict:
+    if model_id not in MODEL_SPECS:
+        raise ValueError(f"Unknown model: {model_id}")
+    return MODEL_SPECS[model_id]
 
 DEFAULTS = {
     "name": "my_lora",
@@ -39,7 +87,7 @@ DEFAULTS = {
         "lr_scheduler": "constant",    # constant | cosine | linear
         "warmup_steps": 0,
         "max_grad_norm": 1.0,
-        "timestep_sampling": "moss",   # moss | logit_normal | shift | uniform
+        "timestep_sampling": "moss",   # moss | flux_shift | logit_normal | shift | uniform
         "shift": 3.0,
         "logit_mean": 0.0,
         "logit_std": 1.0,
@@ -68,6 +116,17 @@ DEFAULTS = {
         "uncond_skip_layer": 22,       # -1 disables
     },
 }
+
+
+def defaults_for(model_id: str) -> dict:
+    """DEFAULTS with the model's recommended sampling / timestep settings filled in."""
+    d = MODEL_SPECS.get(model_id, {}).get("defaults", {})
+    return merge(DEFAULTS, {
+        "model": model_id,
+        "train": {"timestep_sampling": d.get("timestep_sampling", "moss")},
+        "sample": {"steps": d.get("steps", 30), "cfg": d.get("cfg", 3.0), "shift": d.get("shift", 5.0),
+                   "uncond_skip_layer": d.get("skip_layer", 22)},
+    })
 
 
 def merge(base: dict, override: dict) -> dict:
@@ -99,7 +158,12 @@ def parse_layers(spec) -> list[int] | None:
 
 
 def validate(cfg: dict) -> dict:
-    cfg = merge(DEFAULTS, cfg)
+    spec = MODEL_SPECS.get((cfg or {}).get("model", DEFAULTS["model"]))
+    if spec is None:
+        raise ValueError(f"Unknown model: {cfg.get('model')}")
+    cfg = merge(defaults_for(cfg.get("model", DEFAULTS["model"])), cfg)
+    if not spec.get("trainable"):
+        raise ValueError(f"{spec['label']} is for generation only; train on its teacher/base model instead.")
     if not NAME_RE.match(cfg["name"]):
         raise ValueError("Name may only contain letters, digits, '.', '_' and '-'.")
     if not cfg["dataset"]:

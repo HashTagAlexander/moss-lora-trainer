@@ -30,9 +30,8 @@ sys.stdout = sys.stderr
 
 import torch  # noqa: E402
 
+from .backends import get_backend  # noqa: E402
 from .lora import LoRAStack  # noqa: E402
-from .model import (MOSSImageScheduler, TextEncoder, load_transformer, load_vae, resolve_model,  # noqa: E402
-                    sample)
 
 
 def emit(**event):
@@ -59,6 +58,7 @@ class Worker:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_id = None
+        self.backend = None
         self.te = None
         self.transformer = None
         self.vae = None
@@ -71,19 +71,21 @@ class Worker:
         if self.model_id == model_id:
             return
         self.free()
-        emit(event="status", state="loading", message=f"Loading {model_id.split('/')[-1]}…")
-        root = resolve_model(model_id)
+        emit(event="status", state="loading", message=f"Loading {model_id.split('/')[-1]} (first time downloads it)…")
+        backend = get_backend(model_id)
+        backend.prefetch()
         te_device = torch.device("cpu") if low_vram else self.device
         fake_dim = os.environ.get("MOSS_TEST_FAKE_TE")  # tests only: skip the 9B encoder
-        self.te = _FakeTE(int(fake_dim)) if fake_dim else TextEncoder(root, te_device)
-        self.transformer = load_transformer(root).to(self.device).eval()
-        self.vae = load_vae(root).to(self.device)
-        self.loras = LoRAStack(self.transformer)
+        self.te = _FakeTE(int(fake_dim)) if fake_dim else backend.load_text_encoder(te_device)
+        self.transformer = backend.load_transformer(self.device)
+        self.vae = backend.load_vae(self.device)
+        self.loras = LoRAStack(self.transformer, name_map=backend.lora_name_map)
+        self.backend = backend
         self.model_id = model_id
         emit(event="status", state="ready", model=model_id, message="Model loaded")
 
     def free(self):
-        self.te = self.transformer = self.vae = self.loras = None
+        self.te = self.transformer = self.vae = self.loras = self.backend = None
         self.model_id = None
         self.embeds.clear()
         gc.collect()
@@ -140,7 +142,6 @@ class Worker:
         if base_seed < 0:
             base_seed = random.randint(0, 2**31 - 1)
         skip = int(req.get("skip_layer", 22))
-        scheduler = MOSSImageScheduler(shift=float(req.get("shift", 5.0)))
         width, height = int(req["width"]) // 16 * 16, int(req["height"]) // 16 * 16
         steps = int(req.get("steps", 50))
 
@@ -153,10 +154,10 @@ class Worker:
                 emit(event="progress", id=rid, image=i, count=count, step=step, steps=total)
 
             t0 = time.time()
-            img = sample(self.transformer, scheduler, self.vae, pos, neg, width=width, height=height,
-                         steps=steps, cfg=float(req.get("cfg", 3.0)), seed=seed,
-                         uncond_skip_layers=(skip,) if skip >= 0 else (), device=self.device,
-                         progress=progress)
+            img = self.backend.sample(self.transformer, self.vae, pos, neg, width=width, height=height,
+                                      steps=steps, cfg=float(req.get("cfg", 3.0)), seed=seed,
+                                      shift=float(req.get("shift", 0.0)), skip_layer=skip, device=self.device,
+                                      progress=progress)
             stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{rid}_{i}"
             img.save(out_dir / f"{stem}.png")
             thumb = img.copy()

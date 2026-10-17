@@ -28,7 +28,8 @@ import torch.nn.functional as F
 from . import lora as lora_lib
 from .config import parse_layers, validate
 from .data import BucketSampler, TextCache, apply_trigger, build_items, cache_latents, load_latent
-from .model import (MOSSImageScheduler, load_transformer, load_vae, pad_embeds, resolve_model, sample)
+from .backends import Backend, get_backend, sigma_shift_flux
+from .model import pad_embeds
 
 
 class StopRequested(Exception):
@@ -70,9 +71,14 @@ class Job:
 
 # --------------------------------------------------------------------------- timesteps
 
-def sample_sigmas(n: int, t: dict, device) -> torch.Tensor:
+def sample_sigmas(n: int, t: dict, device, tokens: int = 4096) -> torch.Tensor:
     mode = t["timestep_sampling"]
-    if mode == "moss":
+    if mode == "flux_shift":
+        # FLUX / Krea 2: logit-normal u, then the resolution-aware exponential shift used at inference.
+        from .backends import Krea2Backend
+        u = torch.sigmoid(torch.randn(n) * t["logit_std"] + t["logit_mean"]).clamp(1e-4, 1 - 1e-4)
+        sig = sigma_shift_flux(u, Krea2Backend.calculate_mu(tokens))
+    elif mode == "moss":
         # MOSS-Image final pretraining stage (tech report, Table 6): S = 1 - sigmoid(Z),
         # Z ~ N(-1.09, 0.95), truncated at 0.95 then rescaled onto [0, 1], mixed with 1% uniform.
         mu, s, cut, rho = -1.09, 0.95, 0.95, 0.01
@@ -143,9 +149,9 @@ def run(job: Job):
     dataset_dir = job.workspace / "datasets" / cfg["dataset"]
     cache_root = job.workspace / "cache"
 
-    job.set(state="loading", message="Downloading / locating model weights")
-    root = resolve_model(cfg["model"])
-    job.log(f"model: {root}")
+    job.set(state="loading", message="Downloading / locating model weights (first run can take a while)")
+    backend: Backend = get_backend(cfg["model"])
+    job.log(f"model: {cfg['model']} ({backend.family}) -> {backend.prefetch()}")
 
     items = build_items(dataset_dir, cfg["data"]["resolutions"], cfg["trigger_word"], cfg["data"]["flip"], job.log)
     job.log(f"dataset: {len(items)} training entries from {dataset_dir}")
@@ -159,13 +165,12 @@ def run(job: Job):
     prompts = {it.caption for it in items} | {"", neg_prompt} | set(sample_prompts)
 
     # ---- text embeddings (Qwen3.5-9B is loaded only if something is missing, then freed)
-    text_cache = TextCache(cache_root / "text", cfg["model"])
+    text_cache = TextCache(cache_root / "text", backend.text_cache_id)
     missing = text_cache.missing(prompts)
     if missing:
-        from .model import TextEncoder
         job.set(state="caching_text", message=f"Loading text encoder to embed {len(missing)} prompts")
-        job.log(f"encoding {len(missing)} prompts with Qwen3.5-9B")
-        enc = TextEncoder(root, device)
+        job.log(f"encoding {len(missing)} prompts")
+        enc = backend.load_text_encoder(device)
         text_cache.fill(enc, missing, job.progress("caching_text", "Encoding captions"))
         enc.unload()
         del enc
@@ -173,18 +178,19 @@ def run(job: Job):
 
     # ---- latents
     job.set(state="caching_latents", message="Loading VAE")
-    vae = load_vae(root).to(device)
-    n = cache_latents(items, vae, cache_root / "latents", job.progress("caching_latents", "Encoding images"))
+    vae = backend.load_vae(device)
+    n = cache_latents(items, vae, cache_root / "latents", job.progress("caching_latents", "Encoding images"),
+                      encode_fn=backend.encode_images, tag=backend.latent_tag)
     job.log(f"latents: {n} new, {len(items) - n} cached")
     job.check_stop()
 
     # ---- transformer + LoRA
     job.set(state="loading", message="Loading transformer")
-    transformer = load_transformer(root).to(device)
+    transformer = backend.load_transformer(device)
     net = cfg["network"]
     modules = lora_lib.inject(transformer, net["rank"], net["alpha"], net["targets"], net["dropout"],
-                              parse_layers(net["layers"]))
-    transformer.set_gradient_checkpointing(t["gradient_checkpointing"])
+                              parse_layers(net["layers"]), backend.lora_targets, backend.lora_layer_re)
+    backend.set_gradient_checkpointing(transformer, t["gradient_checkpointing"])
     params = list(lora_lib.parameters(modules))
     job.log(f"LoRA: {len(modules)} modules, {sum(p.numel() for p in params) / 1e6:.2f}M trainable params")
     for p in params:
@@ -209,8 +215,6 @@ def run(job: Job):
         step = st["step"]
         job.log(f"resumed from step {step}")
 
-    scheduler = MOSSImageScheduler(shift=sc["shift"])
-    skip = (sc["uncond_skip_layer"],) if sc["uncond_skip_layer"] >= 0 else ()
     save_dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(cfg["save"]["dtype"], torch.bfloat16)
 
     def do_samples(at_step):
@@ -221,9 +225,10 @@ def run(job: Job):
         index = [e for e in index if e["step"] != at_step]
         for i, prompt in enumerate(sample_prompts):
             job.set(state="sampling", message=f"Sample {i + 1}/{len(sample_prompts)}")
-            img = sample(transformer, scheduler, vae, text_cache.get(prompt), text_cache.get(neg_prompt),
-                         width=sc["width"], height=sc["height"], steps=sc["steps"], cfg=sc["cfg"],
-                         seed=sc["seed"] + i, uncond_skip_layers=skip, device=device)
+            img = backend.sample(transformer, vae, text_cache.get(prompt), text_cache.get(neg_prompt),
+                                 width=sc["width"], height=sc["height"], steps=sc["steps"], cfg=sc["cfg"],
+                                 seed=sc["seed"] + i, shift=sc["shift"], skip_layer=sc["uncond_skip_layer"],
+                                 device=device)
             fname = f"{at_step:06d}_{i:02d}.jpg"
             img.save(job.samples_dir / fname, quality=92)
             index.append({"step": at_step, "index": i, "prompt": prompt, "file": fname})
@@ -237,7 +242,7 @@ def run(job: Job):
         meta = {"ss_base_model": cfg["model"], "ss_steps": str(at_step), "ss_trigger": cfg["trigger_word"],
                 "ss_network_rank": str(net["rank"]), "ss_network_alpha": str(net["alpha"]),
                 "moss_trainer_config": cfg}
-        lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype)
+        lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype, backend.lora_format)
         torch.save({
             "lora": {**{k + ".A": m.lora_A.weight.detach().cpu() for k, m in modules.items()},
                      **{k + ".B": m.lora_B.weight.detach().cpu() for k, m in modules.items()}},
@@ -280,11 +285,11 @@ def run(job: Job):
             caps = ["" if random.random() < drop else it.caption for it in batch]
             embeds, mask = pad_embeds([text_cache.get(c) for c in caps], device)
             noise = torch.randn_like(x0)
-            sig = sample_sigmas(len(batch), t, device)
+            sig = sample_sigmas(len(batch), t, device, backend.tokens(x0))
             s = sig.view(-1, 1, 1, 1)
             noisy = (1 - s) * x0 + s * noise
             with autocast:
-                pred = transformer(noisy, sig * 1000, embeds, mask)
+                pred = backend.predict(transformer, noisy, sig, embeds, mask)
             loss = F.mse_loss(pred.float(), noise - x0) / t["grad_accum"]
             loss.backward()
             loss_total += loss.item()

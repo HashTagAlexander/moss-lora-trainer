@@ -320,7 +320,7 @@ class TextEncoder:
 
 def pad_embeds(rows: list[torch.Tensor], device=None):
     length = max(r.shape[0] for r in rows)
-    embeds = rows[0].new_zeros(len(rows), length, rows[0].shape[-1])
+    embeds = rows[0].new_zeros(len(rows), length, *rows[0].shape[1:])
     mask = torch.zeros(len(rows), length, dtype=torch.bool)
     for i, r in enumerate(rows):
         embeds[i, :r.shape[0]] = r

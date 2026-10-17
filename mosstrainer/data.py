@@ -97,12 +97,14 @@ def text_key(model_id: str, prompt: str) -> str:
     return _digest("text-v1", model_id, prompt)
 
 
-def cache_latents(items: list[Item], vae, cache_dir: Path, progress=None):
-    from .model import encode_images
+def cache_latents(items: list[Item], vae, cache_dir: Path, progress=None, encode_fn=None, tag: str = "lat-v1"):
+    if encode_fn is None:
+        from .model import encode_images as encode_fn
+    encode_images = encode_fn
     cache_dir.mkdir(parents=True, exist_ok=True)
     for it in items:
         st = it.image.stat()
-        it.latent_path = cache_dir / f"{_digest('lat-v1', it.image.resolve(), st.st_mtime_ns, st.st_size, it.bucket, it.flip)}.safetensors"
+        it.latent_path = cache_dir / f"{_digest(tag, it.image.resolve(), st.st_mtime_ns, st.st_size, it.bucket, it.flip)}.safetensors"
     todo = [it for it in items if not it.latent_path.exists()]
     for i, it in enumerate(todo):
         pixels = load_pixels(it.image, it.bucket, it.flip).unsqueeze(0)

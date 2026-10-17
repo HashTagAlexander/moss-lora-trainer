@@ -40,7 +40,7 @@ Optional variables:
 | Variable | Purpose |
 |---|---|
 | `HF_TOKEN` | Hugging Face token, if downloads get rate-limited |
-| `MODELS` | Models to pre-download, e.g. `OpenMOSS-Team/MOSS-Image-Base OpenMOSS-Team/MOSS-Image-SFT` |
+| `MODELS` | Models to pre-download, e.g. `OpenMOSS-Team/MOSS-Image-Base kroma-v0.3-teacher kroma-v0.3.1-turbo` |
 | `KEEP_AUTH=1` | Keep the trainer's own `admin` password as well as vast's login |
 
 Click **Create** (or **Save**). From now on, pick this template when renting.

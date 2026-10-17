@@ -555,7 +555,7 @@ async function pageNewJob(params) {
   const sections = [
     ["Job", [
       F.text("name", "Job name", "Also used as the LoRA filename.", mode === "edit" ? "readonly" : ""),
-      F.sel("model", "Base model", Object.entries(INFO.models)),
+      F.sel("model", "Base model", Object.entries(INFO.trainable), "Changing it loads that model's recommended sampling settings."),
       F.sel("dataset", "Dataset", datasets.length ? datasets.map((d) => [d.name, `${d.name} (${d.count} images)`]) : [["", "— create a dataset first —"]],
         `<a href="#/datasets">Manage datasets</a>`),
       F.text("trigger_word", "Trigger word", "Prepended to captions; replaces <span class='mono'>[trigger]</span> in captions and sample prompts."),
@@ -588,7 +588,7 @@ async function pageNewJob(params) {
       F.bool("train.gradient_checkpointing", "Gradient checkpointing", "Saves VRAM at ~25% speed cost. 96 GB cards can usually turn this off at 1024."),
     ]],
     ["Timesteps", [
-      F.sel("train.timestep_sampling", "Timestep sampling", [["moss", "MOSS pretraining (truncated logit-normal)"], ["logit_normal", "Logit-normal"], ["shift", "Shifted uniform"], ["uniform", "Uniform"]],
+      F.sel("train.timestep_sampling", "Timestep sampling", [["moss", "MOSS pretraining (truncated logit-normal)"], ["flux_shift", "Resolution-shifted logit-normal (Krea 2 / FLUX)"], ["logit_normal", "Logit-normal"], ["shift", "Shifted uniform"], ["uniform", "Uniform"]],
         "MOSS = the distribution from the final pretraining stage (tech report, Table 6)."),
       F.num("train.shift", "Shift", "For “Shifted uniform”.", 'step="any"'),
       F.num("train.logit_mean", "Logit mean", "For “Logit-normal”.", 'step="any"'),
@@ -604,10 +604,10 @@ async function pageNewJob(params) {
       F.num("sample.width", "Width", "", 'step="16"'),
       F.num("sample.height", "Height", "", 'step="16"'),
       F.num("sample.steps", "Steps", "50 is best; 30 is faster.", 'min="1"'),
-      F.num("sample.cfg", "CFG", "", 'step="0.1"'),
-      F.num("sample.shift", "Scheduler shift", "", 'step="0.1"'),
+      F.num("sample.cfg", "CFG", "1 = off. Krea 2's “4.5” equals 5.5 here.", 'step="0.1"'),
+      F.num("sample.shift", "Scheduler shift", "MOSS: 5. Krea 2: 0 = auto by resolution.", 'step="0.01"'),
       F.num("sample.seed", "Seed"),
-      F.num("sample.uncond_skip_layer", "Uncond skip layer", "Negative-branch layer skip (official default 22, −1 off)."),
+      F.num("sample.uncond_skip_layer", "Uncond skip layer", "MOSS only: negative-branch layer skip (default 22, −1 off)."),
       F.bool("sample.sample_first", "Sample before training", "Baseline images at step 0."),
       F.area("sample.prompts", "Sample prompts", "One per line. <span class='mono'>[trigger]</span> is replaced by your trigger word."),
       { path: "sample.negative_prompt", label: "Negative prompt", help: "Leave empty to match the official default.", type: "text", attrs: "", full: true },
@@ -624,6 +624,14 @@ async function pageNewJob(params) {
       <button class="btn" id="save">Save</button><button class="btn btn-primary" id="save-start">${I.play} Save & start</button></div>`;
 
   const form = $("#form");
+  form.addEventListener("change", (e) => {
+    if (e.target.dataset.path !== "model") return;
+    const d = (INFO.model_specs[e.target.value] || {}).defaults || {};
+    const set = (path, v) => { const el = $(`[data-path="${path}"]`, form); if (el && v !== undefined) el.value = v; };
+    set("sample.steps", d.steps); set("sample.cfg", d.cfg); set("sample.shift", d.shift);
+    set("sample.uncond_skip_layer", d.skip_layer); set("train.timestep_sampling", d.timestep_sampling);
+    toast("Loaded the recommended sampling settings for this model", "ok");
+  });
   form.addEventListener("click", (e) => { const c = e.target.closest(".chip"); if (c) c.classList.toggle("on"); });
   $("#json-mode").onchange = (e) => {
     if (e.target.checked) { $("#json").value = JSON.stringify(readForm(form, cfg), null, 2); }
@@ -823,6 +831,7 @@ async function pageGenerate(params) {
           <label class="field" style="grid-column:1/-1">Base model<select id="g-model">${Object.entries(INFO.models).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join("")}</select></label>
           <label class="field">Shift<input type="number" id="g-shift" step="0.1"></label>
           <label class="field">Skip layer<input type="number" id="g-skip" min="-1" max="41" title="Negative-branch layer skip, -1 = off"></label></div></details>
+        <div class="faint" id="g-model-badge" style="font-size:12px;margin-bottom:-6px"></div>
         <button class="btn btn-primary" id="g-go">${I.spark} Generate</button>
       </div></div>
       <div class="gen-results"><div class="card" id="g-status"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
@@ -849,7 +858,15 @@ async function pageGenerate(params) {
     if (k === "mp") applyAspect();
     saveGenState(st);
   });
-  $("#g-model").onchange = (e) => { st.model = e.target.value; saveGenState(st); };
+  const family = () => (INFO.model_specs[st.model] || {}).family;
+  $("#g-model").onchange = (e) => {
+    st.model = e.target.value;
+    const d = (INFO.model_specs[st.model] || {}).defaults || {};
+    Object.assign(st, { steps: d.steps ?? st.steps, cfg: d.cfg ?? st.cfg, shift: d.shift ?? st.shift, skip_layer: d.skip_layer ?? st.skip_layer });
+    for (const k of ["steps", "cfg", "shift", "skip_layer"]) $(fields[k]).value = st[k];
+    saveGenState(st); renderLoras(); renderModelBadge();
+    toast("Loaded the recommended settings for this model", "ok");
+  };
   $("#g-mp").onchange = (e) => { st.mp = +e.target.value; applyAspect(); saveGenState(st); };
   $("#g-aspects").onclick = (e) => {
     const c = e.target.closest("[data-aspect]");
@@ -858,19 +875,24 @@ async function pageGenerate(params) {
   };
   $("#g-random").onclick = (e) => { e.preventDefault(); st.seed = -1; $("#g-seed").value = -1; saveGenState(st); };
 
+  function renderModelBadge() {
+    $("#g-model-badge").textContent = `Model: ${(INFO.model_specs[st.model] || {}).label || st.model} (change under Advanced)`;
+  }
+  renderModelBadge();
+
   // ---- LoRA list
   function renderLoras() {
     $("#g-loras").innerHTML = st.loras.length ? st.loras.map((l, i) => {
       const info = loraInfo(l.id);
       return `<div class="lora-row" data-i="${i}">
-        <div class="lora-name" title="${esc(l.id)}">${esc(info.label)}${info.trigger ? `<span class="faint"> · ${esc(info.trigger)}</span>` : ""}</div>
+        <div class="lora-name" title="${esc(l.id)}">${esc(info.label)}${info.trigger ? `<span class="faint"> · ${esc(info.trigger)}</span>` : ""}${info.family && info.family !== family() ? `<span style="color:var(--red)"> · other model</span>` : ""}</div>
         <input type="range" min="-1" max="2" step="0.05" value="${l.strength}" data-strength>
         <input type="number" step="0.05" value="${l.strength}" data-strength-num>
         ${info.trigger ? `<button class="btn btn-sm btn-ghost" data-trigger title="Add trigger word to prompt">T</button>` : "<span></span>"}
         <button class="btn btn-sm btn-ghost" data-remove title="Remove">${I.x}</button></div>`;
     }).join("") : `<div class="faint" style="font-size:12px">No LoRA, base model only</div>`;
     const groups = {};
-    loras.filter((x) => !st.loras.some((l) => l.id === x.id)).forEach((x) => (groups[x.group] = groups[x.group] || []).push(x));
+    loras.filter((x) => !st.loras.some((l) => l.id === x.id) && (!x.family || x.family === family())).forEach((x) => (groups[x.group] = groups[x.group] || []).push(x));
     $("#g-add").innerHTML = `<option value="">${loras.length ? "+ Add a LoRA…" : "No LoRAs yet: train one first"}</option>` +
       Object.entries(groups).map(([g, xs]) => `<optgroup label="${esc(g)}">${xs.map((x) => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join("")}</optgroup>`).join("");
   }

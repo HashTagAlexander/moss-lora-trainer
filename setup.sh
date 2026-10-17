@@ -13,7 +13,8 @@
 #   MOSS_TRAINER_PASSWORD=...     UI password (generated and saved to .password if unset)
 #   NO_AUTH=1                     disable the password (only if you use an SSH tunnel!)
 #   HF_TOKEN=hf_...               Hugging Face token (only needed if downloads are rate-limited)
-#   MODELS="OpenMOSS-Team/MOSS-Image-Base"   models to pre-download ("" to skip)
+#   MODELS="OpenMOSS-Team/MOSS-Image-Base"   models to pre-download ("" to skip), e.g. also
+#                                 kroma-v0.3-teacher, kroma-v0.3.1-turbo, krea2-raw (see mosstrainer/config.py)
 #   TORCH_INDEX=https://download.pytorch.org/whl/cu128   torch wheel index
 #   WORKSPACE_DIR=/workspace      where datasets/jobs/cache and the HF cache live
 set -euo pipefail
@@ -109,8 +110,8 @@ c_ok "dependencies installed"
 c_step "Model weights → $HF_HOME"
 mkdir -p "$HF_HOME" "$MOSS_WORKSPACE"
 for m in $MODELS; do
-  echo "downloading $m (≈30 GB on first run)…"
-  python -c "import sys; from mosstrainer.model import resolve_model; print(resolve_model(sys.argv[1]))" "$m"
+  echo "downloading $m (MOSS ≈30 GB, Kroma/Krea 2 ≈35 GB on first run; models not listed here download on first use)…"
+  python -c "import sys; from mosstrainer.backends import prefetch; print(prefetch(sys.argv[1]))" "$m"
 done
 c_ok "models ready"
 

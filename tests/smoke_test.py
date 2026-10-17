@@ -6,6 +6,7 @@ Builds a tiny transformer + FLUX.2-style VAE, a 4-image dataset and a pre-filled
 then runs the real trainer process: caching, training, sampling, saving, stop and resume.
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -35,8 +36,12 @@ def build(tmp: Path):
     for i, size in enumerate([(320, 256), (256, 320), (256, 256), (300, 300)]):
         Image.new("RGB", size, (60 * i, 120, 200 - 40 * i)).save(ds / f"img{i}.png")
         (ds / f"img{i}.txt").write_text(f"a flat color swatch number {i}")
+    (tmp / "models.json").write_text(json.dumps({"tiny-moss": {
+        "label": "tiny MOSS", "family": "moss", "trainable": True, "path": str(model),
+        "defaults": {"steps": 3, "cfg": 3.0, "shift": 5.0, "skip_layer": 22, "timestep_sampling": "moss"}}}))
+    os.environ["MOSS_EXTRA_MODELS"] = str(tmp / "models.json")
     cfg = {
-        "name": "toy", "model": str(model), "dataset": "toy", "trigger_word": "zxq",
+        "name": "toy", "model": "tiny-moss", "dataset": "toy", "trigger_word": "zxq",
         "network": {"rank": 4, "alpha": 4, "targets": ["attn", "ffn"]},
         "data": {"resolutions": [256], "caption_dropout": 0.2},
         "train": {"steps": 6, "batch_size": 2, "lr": 1e-3, "gradient_checkpointing": True, "timestep_sampling": "moss"},
@@ -47,7 +52,7 @@ def build(tmp: Path):
     job.mkdir(parents=True)
     (job / "config.json").write_text(json.dumps(cfg))
     # Pre-fill the text cache so the 9B Qwen encoder is never needed.
-    cache = TextCache(ws / "cache" / "text", str(model))
+    cache = TextCache(ws / "cache" / "text", "tiny-moss")
     from safetensors.torch import save_file
     prompts = {apply_trigger(f"a flat color swatch number {i}", "zxq") for i in range(4)} | {"", "zxq swatch"}
     for p in prompts:
@@ -61,7 +66,7 @@ def run(job, steps=None):
         cfg["train"]["steps"] = steps
         (job / "config.json").write_text(json.dumps(cfg))
     r = subprocess.run([sys.executable, "-m", "mosstrainer.train", "--job-dir", str(job)], cwd=ROOT,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=os.environ.copy())
     print(r.stdout[-3000:], r.stderr[-3000:])
     return json.loads((job / "status.json").read_text()), r.stdout
 
