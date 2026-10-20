@@ -66,8 +66,9 @@ Save the template. From now on, pick it when deploying.
 
 - **Connect → HTTP Service [9090]**, or `https://<pod id>-9090.proxy.runpod.net`. Until setup finishes the link
   shows a 502 error: give it time.
-- **Setup progress**: open the web terminal or SSH in and run `tail -f /workspace/moss-setup.log`. The end of the
-  log shows the URL and the `admin` password.
+- **Setup progress and password**: the pod's **Logs → Container** tab shows setup as it runs; when it's done, the end
+  shows the URL and the `admin` login. (The **System** tab only shows the image download.) The same output is in
+  `/workspace/moss-setup.log`, and the password alone is in `/workspace/loratrainer/.password`.
 - **Uploads**: RunPod's proxy runs through Cloudflare, which closes any request that takes longer than 100 seconds.
   Upload big datasets as several smaller zips, or copy them over SSH into
   `/workspace/moss_workspace/datasets/<name>/`.

@@ -23,7 +23,8 @@ main() {
   local log="${MOSS_SETUP_LOG:-/workspace/moss-setup.log}"
   set -o pipefail
   mkdir -p "$(dirname "$log")"
-  exec >>"$log" 2>&1
+  # to the log file and to the container's output, so RunPod's Logs tab shows progress, the URL and the login
+  exec > >(tee -a "$log") 2>&1
   echo "[moss] start $(date)"
   if [ ! -d "$(dirname "$dir")" ] || [ ! -w "$(dirname "$dir")" ]; then
     echo "[moss] ERROR: $(dirname "$dir") is missing or read-only: give the pod a volume mounted at /workspace"
