@@ -200,7 +200,7 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 /* ---------- lightbox / toast / modal ---------- */
 .lightbox { position: fixed; inset: 0; background: rgba(4, 5, 8, .92); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 50; padding: 30px; gap: 14px; }
 .lightbox img { max-width: 100%; max-height: calc(100vh - 140px); border-radius: 8px; box-shadow: 0 20px 60px rgba(0, 0, 0, .5); }
-.lightbox .cap { max-width: 900px; text-align: center; color: var(--muted); font-size: 13px; }
+.lightbox .cap { max-width: 900px; max-height: 18vh; overflow: auto; text-align: center; color: var(--muted); font-size: 13px; }
 .lightbox .nav-btn { position: absolute; top: 50%; transform: translateY(-50%); }
 .lightbox .nav-btn.l { left: 20px; } .lightbox .nav-btn.r { right: 20px; }
 .lightbox .close { position: absolute; top: 18px; right: 20px; }
@@ -271,3 +271,39 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .src-img { position: relative; display: inline-block; }
 .src-img img { max-width: 100%; max-height: 160px; border-radius: 8px; border: 1px solid var(--border); display: block; }
 .src-img .btn { position: absolute; top: 6px; right: 6px; padding: 4px; background: rgba(10, 12, 16, .85); }
+
+/* ---------- VGL editor / layout ---------- */
+.modal.vgl-editor, .vgl-editor { width: 100%; max-width: 1180px; max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.vgl-tabs { margin: 0; border: 0; }
+.vgl-tabs .tab { padding: 6px 12px; }
+.vgl-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 440px); gap: 18px; padding: 16px; overflow: auto; min-height: 0; flex: 1; }
+.vgl-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.vgl-left .help { color: var(--faint); font-size: 11.5px; line-height: 1.45; }
+.vgl-canvas { position: relative; margin: 0 auto; background: var(--bg); border: 1px solid var(--border-2); border-radius: 8px; overflow: hidden; touch-action: none; user-select: none; }
+.vgl-grid { position: absolute; inset: 0; pointer-events: none;
+  background-image: linear-gradient(to right, transparent calc(33.333% - 1px), var(--border) calc(33.333% - 1px), var(--border) 33.333%, transparent 33.333%, transparent calc(66.666% - 1px), var(--border) calc(66.666% - 1px), var(--border) 66.666%, transparent 66.666%),
+                    linear-gradient(to bottom, transparent calc(33.333% - 1px), var(--border) calc(33.333% - 1px), var(--border) 33.333%, transparent 33.333%, transparent calc(66.666% - 1px), var(--border) calc(66.666% - 1px), var(--border) 66.666%, transparent 66.666%); }
+.vgl-boxes { position: absolute; inset: 0; }
+.vgl-box { position: absolute; border: 2px solid var(--c); border-radius: 6px; background: color-mix(in srgb, var(--c) 14%, transparent); cursor: move; }
+.vgl-box.text { border-style: dashed; }
+.vgl-box.sel { box-shadow: 0 0 0 2px var(--c), 0 0 18px color-mix(in srgb, var(--c) 55%, transparent); z-index: 2; }
+.vgl-tag { position: absolute; left: -2px; top: -2px; max-width: calc(100% + 4px); padding: 2px 6px; font-size: 11px; line-height: 1.3; color: #0a0c10; background: var(--c); border-radius: 6px 0 6px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vgl-resize { position: absolute; right: -6px; bottom: -6px; width: 14px; height: 14px; border-radius: 50%; background: var(--c); border: 2px solid var(--bg); cursor: nwse-resize; }
+.vgl-right { min-width: 0; display: flex; flex-direction: column; }
+.vgl-form { display: grid; gap: 12px; align-content: start; }
+.vgl-json { min-height: 60vh; font-size: 12px; flex: 1; }
+.vgl-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.vgl-h { margin-top: 6px; }
+.vgl-entry { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--border); border-left: 3px solid var(--c); border-radius: 8px; background: var(--bg); }
+.vgl-entry.sel { border-color: var(--c); }
+.vgl-entry details summary, .vgl-group summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
+.vgl-sub { display: grid; gap: 10px; margin-top: 10px; }
+.vgl-group { border-top: 1px solid var(--border); padding-top: 10px; }
+.vgl-loc-hint { margin-top: -6px; }
+.lb-stage { position: relative; display: inline-block; max-width: 100%; }
+.lb-stage img { display: block; }
+.lb-stage .vgl-boxes { pointer-events: none; }
+.lb-stage .vgl-box { background: color-mix(in srgb, var(--c) 10%, transparent); }
+.lightbox .layout-btn { position: absolute; top: 18px; right: 70px; }
+.lightbox .layout-btn.on { border-color: var(--accent); color: var(--text); }
+@media (max-width: 860px) { .vgl-body { grid-template-columns: 1fr; } }

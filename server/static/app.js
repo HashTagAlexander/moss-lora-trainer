@@ -128,14 +128,17 @@ function modal({ title, body, confirm = "OK", danger = false }) {
 const confirmBox = (title, text, confirm = "Delete") =>
   modal({ title, body: `<p class="muted" style="margin:0">${esc(text)}</p>`, confirm, danger: true });
 
+let showLayout = false;  // lightbox: draw the prompt's VGL layout over the image (remembered while the page is open)
 function lightbox(list, index) {
   const bg = document.createElement("div");
   bg.className = "lightbox";
   const show = () => {
-    const it = list[index];
+    const it = list[index], boxes = it.layout || [];
     bg.innerHTML = `<button class="btn btn-ghost close">${I.x}</button>
       ${list.length > 1 ? `<button class="btn nav-btn l">${I.left}</button><button class="btn nav-btn r">${I.right}</button>` : ""}
-      <img src="${esc(it.src)}"><div class="cap">${it.title ? `<b>${esc(it.title)}</b><br>` : ""}${esc(it.caption || "")}</div>`;
+      ${boxes.length ? `<button class="btn btn-sm layout-btn ${showLayout ? "on" : ""}" title="Show where the prompt places its objects and texts">${showLayout ? "Hide" : "Show"} layout</button>` : ""}
+      <div class="lb-stage"><img src="${esc(it.src)}">${showLayout && boxes.length ? `<div class="vgl-boxes">${VGL.boxesHtml(boxes)}</div>` : ""}</div>
+      <div class="cap">${it.title ? `<b>${esc(it.title)}</b><br>` : ""}${esc((VGL.parse(it.caption || "") || {}).short_description || it.caption || "")}${showLayout && boxes.length ? '<br><span class="faint">Layout = where the prompt\'s location / size words put things (a 3×3 grid), not detected positions.</span>' : ""}</div>`;
   };
   const move = (d) => { index = (index + d + list.length) % list.length; show(); };
   const close = () => { bg.remove(); document.removeEventListener("keydown", key); };
@@ -147,6 +150,7 @@ function lightbox(list, index) {
   bg.addEventListener("click", (e) => {
     if (e.target.closest(".l")) return move(-1);
     if (e.target.closest(".r")) return move(1);
+    if (e.target.closest(".layout-btn")) { showLayout = !showLayout; return show(); }
     if (e.target === bg || e.target.closest(".close")) close();
   });
   document.addEventListener("keydown", key);
@@ -391,7 +395,7 @@ async function pageJob(name) {
 
   function sampleList() {
     return job.samples.slice().sort((a, b) => b.step - a.step || a.index - b.index)
-      .map((s) => ({ ...s, src: `${base}/sample/${enc(s.file)}`, title: `Step ${s.step}`, caption: s.prompt }));
+      .map((s) => ({ ...s, src: `${base}/sample/${enc(s.file)}`, title: `Step ${s.step}`, caption: s.prompt, layout: VGL.layout(s.prompt) }));
   }
   function renderSamples() {
     const list = sampleList();
@@ -931,7 +935,9 @@ async function pageGenerate(params) {
       <div class="row" id="g-worker"></div></div>
     <div class="gen-layout">
       <div class="card gen-controls"><div class="card-body gen-form">
-        <label class="field">Prompt<textarea id="g-prompt" rows="5" placeholder="Describe the image… (⌘/Ctrl + Enter to generate)"></textarea></label>
+        <div class="field"><div class="row" style="justify-content:space-between"><span>Prompt</span>
+          <button class="btn btn-sm btn-ghost" id="g-vgl" hidden title="Build or edit a structured VGL prompt with a layout view">${I.edit} VGL editor</button></div>
+          <textarea id="g-prompt" rows="5" placeholder="Describe the image… (⌘/Ctrl + Enter to generate)"></textarea></div>
         <label class="field">Negative prompt<textarea id="g-negative" rows="2" placeholder="Optional, e.g. worst quality, bad anatomy, watermark"></textarea></label>
         <div class="field" id="g-src-field" hidden><div class="row" style="justify-content:space-between"><span>Source image <span class="help">optional: edit this image</span></span>
           <label class="btn btn-sm btn-ghost" style="cursor:pointer">${I.upload} Upload<input type="file" id="g-src-file" accept="image/*" hidden></label></div>
@@ -1000,6 +1006,7 @@ async function pageGenerate(params) {
   // ---- source image (Fibo 2.0 edits)
   function renderSource() {
     const edit = !!(INFO.model_specs[st.model] || {}).edit;
+    $("#g-vgl").hidden = family() !== "fibo2";
     $("#g-src-field").hidden = !edit;
     $("#g-prompt").placeholder = edit
       ? (st.image ? "The edit instruction, e.g. “Make the jacket red leather”… (⌘/Ctrl + Enter)" : "Describe the image, or paste a VGL JSON caption… (⌘/Ctrl + Enter)")
@@ -1010,6 +1017,11 @@ async function pageGenerate(params) {
       : `<div class="faint" style="font-size:12px">None: text-to-image${st.model.includes("turbo") ? ". Edit Turbo is made for editing; text-to-image works best on Fibo 2.0 Dev." : ""}</div>`;
   }
   renderSource();
+  $("#g-vgl").onclick = async () => {
+    const out = await VGL.open({ prompt: st.prompt, width: st.width, height: st.height });
+    if (out == null) return;
+    st.prompt = out; $("#g-prompt").value = out; saveGenState(st);
+  };
   $("#g-src-file").onchange = async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -1150,7 +1162,7 @@ async function pageGenerate(params) {
   $("#g-more").onclick = (e) => { if (e.target.closest("#g-load-more")) { limit += 60; loadGallery(); } };
   $("#g-gallery").addEventListener("click", async (e) => {
     const open = e.target.closest("[data-open]"), reuse = e.target.closest("[data-reuse]"), del = e.target.closest("[data-del]");
-    if (open) lightbox(items.map((it) => ({ src: fileUrl(it.file), title: describe(it), caption: it.prompt })), +open.dataset.open);
+    if (open) lightbox(items.map((it) => ({ src: fileUrl(it.file), title: describe(it), caption: it.prompt, layout: VGL.layout(it.prompt) })), +open.dataset.open);
     if (reuse) {
       const it = items[+reuse.dataset.reuse];
       Object.assign(st, { prompt: it.prompt, negative: it.negative || "", width: it.width, height: it.height, steps: it.steps,

@@ -52,6 +52,10 @@ from the same page, or let them download on first use. Everything runs on diffus
 - **Generate tab**: text-to-image, or upload a **source image** to edit it (the prompt is then the edit instruction,
   or a VGL caption of the result with an `edit_instruction` key). Edit Turbo does edits in 4 steps without CFG.
   The default negative for Dev is the one from Bria's model card.
+- **VGL editor** (Generate tab, Fibo models): a form for every VGL field with a layout canvas where objects and texts
+  are boxes you drag and resize. Fibo 2.0 places things by words (`location`, `relative_size`), not coordinates, so
+  boxes snap to the 3×3 grid those words describe. **Show layout** in the image viewer draws a prompt's layout over the
+  generated image. **Copy as one line** gives a prompt ready for the sample prompts box.
 
 ## How training works
 
