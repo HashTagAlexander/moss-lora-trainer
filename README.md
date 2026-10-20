@@ -110,6 +110,19 @@ Useful setup options: `HF_TOKEN=hf_... bash setup.sh`, `MODELS="OpenMOSS-Team/MO
 Everything persistent lives under `/workspace/moss_workspace/` (datasets, jobs, caches) and
 `/workspace/hf_cache/` (model weights).
 
+## RunPod
+
+The same setup works on RunPod. **[runpod/TEMPLATE.md](runpod/TEMPLATE.md)** has the template settings: a volume at
+`/workspace`, HTTP port 9090, and a container start command that runs [`runpod/boot.sh`](runpod/boot.sh) on every
+pod start. RunPod wipes everything outside `/workspace` when a pod stops, so `setup.sh` keeps uv, its Python, the venv,
+the weights and your data there, and the boot script reinstalls the rest. Open the UI at
+`https://<pod id>-9090.proxy.runpod.net` (user `admin`; the password is in `/workspace/moss-setup.log`, or set it
+with `MOSS_TRAINER_PASSWORD`).
+
+For a one-off pod without a template: expose HTTP port 9090, then in the web terminal run
+`cd /workspace && git clone https://github.com/HashTagAlexander/moss-lora-trainer.git loratrainer && bash loratrainer/setup.sh`.
+After a stop/start, run `bash /workspace/loratrainer/setup.sh` again (quick: everything is cached on the volume).
+
 ## Workflow
 
 1. **Datasets → New dataset**, then drop in images. Captions pair with images by filename (`foo.jpg` + `foo.txt`).
