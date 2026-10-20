@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -29,14 +30,19 @@ from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from mosstrainer.config import DEFAULTS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE, validate  # noqa: E402
+from mosstrainer import captioner  # noqa: E402
+from mosstrainer.config import (DEFAULTS, FAMILY_TARGETS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE,  # noqa: E402
+                                validate)
 
 WORKSPACE = Path(os.environ.get("MOSS_WORKSPACE", ROOT / "workspace")).resolve()
 DATASETS = WORKSPACE / "datasets"
 JOBS = WORKSPACE / "jobs"
 GENERATIONS = WORKSPACE / "generations"
+INPUTS = GENERATIONS / "inputs"
 LORAS = WORKSPACE / "loras"
-for d in (DATASETS, JOBS, WORKSPACE / "cache", GENERATIONS, LORAS):
+DOWNLOADS = WORKSPACE / "downloads"
+SETTINGS = WORKSPACE / "settings.json"
+for d in (DATASETS, JOBS, WORKSPACE / "cache", GENERATIONS, INPUTS, LORAS, DOWNLOADS):
     d.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -90,6 +96,32 @@ def write_json(path: Path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- settings (API keys)
+
+_ENV_HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+
+def load_settings() -> dict:
+    return {"hf_token": "", "openrouter_key": "", "caption_model": captioner.DEFAULT_MODEL,
+            **read_json(SETTINGS, {})}
+
+
+def apply_settings(s: dict):
+    """The trainer, generation worker and downloads inherit HF_TOKEN from the server's environment."""
+    token = s.get("hf_token") or _ENV_HF_TOKEN
+    if token:
+        os.environ["HF_TOKEN"] = token
+    else:
+        os.environ.pop("HF_TOKEN", None)
+
+
+def mask_secret(s: str) -> str:
+    return "" if not s else f"{s[:3]}…{s[-4:]}" if len(s) > 10 else "•" * len(s)
+
+
+apply_settings(load_settings())
 
 
 def pid_alive(pid) -> bool:
@@ -311,6 +343,12 @@ class GenManager:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
 
+    def restart_if_idle(self):
+        """Stop an idle worker so the next one starts with the current environment (e.g. a new HF token)."""
+        with self.lock:
+            if not self.current and not self.queue and self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+
     def snapshot(self):
         with self.lock:
             brief = lambda r: {"id": r["id"], "prompt": r.get("prompt", "")[:200], "count": r.get("count", 1)}  # noqa: E731
@@ -326,14 +364,217 @@ class GenManager:
 gen_manager = GenManager()
 
 
+# --------------------------------------------------------------------------- model downloads
+
+def _tail_line(path: Path) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            text = f.read().decode("utf-8", "replace")
+    except FileNotFoundError:
+        return ""
+    lines = [ln.strip() for ln in re.split(r"[\r\n]", text) if ln.strip()]
+    return lines[-1][-300:] if lines else ""
+
+
+class DownloadManager:
+    """Pre-downloads model weights (Settings page) in a subprocess that uses the HF token from Settings."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.procs: dict[str, subprocess.Popen] = {}
+
+    @staticmethod
+    def _slug(model: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", model)
+
+    def start(self, model: str):
+        with self.lock:
+            p = self.procs.get(model)
+            if p and p.poll() is None:
+                return
+            slug = self._slug(model)
+            (DOWNLOADS / f"{slug}.ok").unlink(missing_ok=True)
+            log = open(DOWNLOADS / f"{slug}.log", "w")
+            code = "import sys; from mosstrainer.backends import prefetch; print('Done:', prefetch(sys.argv[1]))"
+            self.procs[model] = subprocess.Popen(
+                [sys.executable, "-c", code, model], cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
+
+    def status(self, model: str) -> dict:
+        slug = self._slug(model)
+        msg = _tail_line(DOWNLOADS / f"{slug}.log")
+        with self.lock:
+            p = self.procs.get(model)
+            if p and p.poll() is None:
+                return {"state": "downloading", "message": msg}
+            if p and p.returncode == 0:
+                (DOWNLOADS / f"{slug}.ok").touch()
+            elif p:
+                return {"state": "error", "message": msg or f"exited with code {p.returncode}"}
+        if (DOWNLOADS / f"{slug}.ok").exists():
+            return {"state": "done", "message": ""}
+        return {"state": "none", "message": ""}
+
+
+downloads = DownloadManager()
+
+
+# --------------------------------------------------------------------------- VLM captioning (OpenRouter)
+
+class CaptionManager:
+    """Writes VGL captions for a dataset's images in the background, a few requests at a time."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.runs: dict[str, dict] = {}
+
+    def status(self, dataset: str) -> dict:
+        with self.lock:
+            st = self.runs.get(dataset)
+            return {k: v for k, v in st.items() if k != "cancel"} if st else {"state": "idle"}
+
+    def start(self, dataset: str, files: list[str], extra: str):
+        s = load_settings()
+        if not s.get("openrouter_key"):
+            raise HTTPException(400, "Add your OpenRouter API key in Settings first.")
+        with self.lock:
+            if self.runs.get(dataset, {}).get("state") == "running":
+                raise HTTPException(409, "Captioning is already running for this dataset")
+            st = {"state": "running", "total": len(files), "done": 0, "failed": 0, "errors": [], "cancel": False,
+                  "model": s.get("caption_model") or captioner.DEFAULT_MODEL, "finished": [], "started": time.time()}
+            self.runs[dataset] = st
+        threading.Thread(target=self._run, args=(dataset, files, extra, s, st), daemon=True).start()
+
+    def cancel(self, dataset: str):
+        with self.lock:
+            if dataset in self.runs:
+                self.runs[dataset]["cancel"] = True
+
+    def _run(self, dataset, files, extra, s, st):
+        from concurrent.futures import ThreadPoolExecutor
+        folder = DATASETS / dataset
+
+        def one(name):
+            if st["cancel"]:
+                return
+            try:
+                cap = captioner.caption_image(folder / name, s["openrouter_key"], st["model"], extra)
+                (folder / name).with_suffix(".txt").write_text(captioner.caption_text(cap), encoding="utf-8")
+                with self.lock:
+                    st["done"] += 1
+                    st["finished"].append(name)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e) if isinstance(e, captioner.CaptionError) else f"{type(e).__name__}: {e}"
+                with self.lock:
+                    st["failed"] += 1
+                    st["errors"] = (st["errors"] + [f"{name}: {msg}"])[-20:]
+                    if any(f"HTTP {c}" in msg for c in (401, 402, 403)):
+                        st["cancel"] = True  # bad key or no credits: stop instead of failing every image
+        with ThreadPoolExecutor(4) as ex:
+            list(ex.map(one, files))
+        with self.lock:
+            st["state"] = "cancelled" if st["cancel"] and st["done"] + st["failed"] < st["total"] else "done"
+            st["ended"] = time.time()
+
+
+captions = CaptionManager()
+
+
 # --------------------------------------------------------------------------- system
 
 @app.get("/api/info")
 def info():
     specs = {k: {"label": v["label"], "family": v["family"], "trainable": bool(v.get("trainable")),
-                 "defaults": v.get("defaults", {})} for k, v in MODEL_SPECS.items()}
+                 "gated": bool(v.get("gated")), "edit": bool(v.get("edit")), "defaults": v.get("defaults", {}),
+                 "overrides": v.get("overrides", {})} for k, v in MODEL_SPECS.items()}
     return {"defaults": DEFAULTS, "models": MODELS, "trainable": TRAINABLE, "model_specs": specs,
-            "workspace": str(WORKSPACE), "auth": bool(PASSWORD)}
+            "families": FAMILY_TARGETS, "workspace": str(WORKSPACE), "auth": bool(PASSWORD)}
+
+
+# --------------------------------------------------------------------------- settings
+
+@app.get("/api/settings")
+def get_settings():
+    s = load_settings()
+    return {"hf_token": mask_secret(s["hf_token"]), "has_hf_token": bool(s["hf_token"]),
+            "env_hf_token": bool(_ENV_HF_TOKEN), "openrouter_key": mask_secret(s["openrouter_key"]),
+            "has_openrouter_key": bool(s["openrouter_key"]), "caption_model": s["caption_model"],
+            "caption_model_default": captioner.DEFAULT_MODEL}
+
+
+@app.put("/api/settings")
+async def put_settings(request: Request):
+    body = await request.json()
+    s = load_settings()
+    old_token = s["hf_token"]
+    for key in ("hf_token", "openrouter_key", "caption_model"):
+        if isinstance(body.get(key), str):  # absent = keep; "" = clear
+            s[key] = body[key].strip()
+    s["caption_model"] = s["caption_model"] or captioner.DEFAULT_MODEL
+    tmp = SETTINGS.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:  # owner-only: holds keys
+        json.dump(s, f, indent=2)
+    os.replace(tmp, SETTINGS)
+    apply_settings(s)
+    if s["hf_token"] != old_token:
+        gen_manager.restart_if_idle()
+    return get_settings()
+
+
+@app.post("/api/settings/check-hf")
+def check_hf():
+    """Who the token belongs to, and whether it can download each gated model."""
+    from huggingface_hub import auth_check, whoami
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+    out = {"user": None, "error": None, "access": {}}
+    try:
+        out["user"] = whoami().get("name")
+    except Exception as e:  # noqa: BLE001
+        out["error"] = "No valid Hugging Face token" if "token" in str(e).lower() else str(e)[:200]
+    for mid, spec in MODEL_SPECS.items():
+        if not spec.get("gated"):
+            continue
+        repo = spec.get("repo", mid)
+        try:
+            auth_check(repo)
+            out["access"][repo] = "ok"
+        except GatedRepoError:
+            out["access"][repo] = "gated"
+        except RepositoryNotFoundError:
+            out["access"][repo] = "no_access"
+        except Exception as e:  # noqa: BLE001
+            out["access"][repo] = str(e)[:200]
+    return out
+
+
+@app.post("/api/settings/check-openrouter")
+def check_openrouter():
+    key = load_settings()["openrouter_key"]
+    if not key:
+        raise HTTPException(400, "No OpenRouter key saved")
+    try:
+        return captioner.check_key(key)
+    except captioner.CaptionError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/models")
+def list_models():
+    return [{"id": k, "label": v["label"], "family": v["family"], "trainable": bool(v.get("trainable")),
+             "gated": bool(v.get("gated")), "repo": v.get("repo", k) if "/" in v.get("repo", k) else None,
+             "download": downloads.status(k)} for k, v in MODEL_SPECS.items()]
+
+
+@app.post("/api/models/download")
+async def download_model(request: Request):
+    model = (await request.json()).get("model")
+    if model not in MODEL_SPECS:
+        raise HTTPException(400, "Unknown model")
+    downloads.start(model)
+    return downloads.status(model)
 
 
 @app.get("/api/gpu")
@@ -450,6 +691,15 @@ async def upload(name: str, files: list[UploadFile] = File(...)):
         elif ext == ".txt":
             (folder / _clean_name(filename)).write_bytes(data)
             captions += 1
+        elif ext == ".json":  # a structured (VGL) caption, e.g. from Bria's tools: stored as the image's .txt
+            try:
+                obj = json.loads(data)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if isinstance(obj, dict):
+                (folder / _clean_name(Path(filename).stem + ".txt")).write_text(
+                    captioner.caption_text(obj), encoding="utf-8")
+                captions += 1
 
     for f in files:
         data = await f.read()
@@ -497,6 +747,40 @@ async def bulk_caption(name: str, request: Request):
             txt.write_text(new.strip(), encoding="utf-8")
             changed += 1
     return {"changed": changed}
+
+
+@app.post("/api/datasets/{name}/autocaption")
+async def autocaption(name: str, request: Request):
+    """Caption images with a VLM in Bria's VGL format. scope: missing | all | files (with "files")."""
+    folder = DATASETS / safe_name(name)
+    if not folder.is_dir():
+        raise HTTPException(404)
+    body = await request.json()
+    scope = body.get("scope", "missing")
+    images = dataset_images(folder)
+    if scope == "files":
+        wanted = set(body.get("files") or [])
+        files = [p.name for p in images if p.name in wanted]
+    elif scope == "all":
+        files = [p.name for p in images]
+    else:
+        files = [p.name for p in images
+                 if not (p.with_suffix(".txt").exists() and p.with_suffix(".txt").read_text(encoding="utf-8").strip())]
+    if not files:
+        raise HTTPException(400, "No images to caption")
+    captions.start(name, files, str(body.get("extra", ""))[:2000])
+    return captions.status(name)
+
+
+@app.get("/api/datasets/{name}/autocaption")
+def autocaption_status(name: str):
+    return captions.status(safe_name(name))
+
+
+@app.post("/api/datasets/{name}/autocaption/cancel")
+def autocaption_cancel(name: str):
+    captions.cancel(safe_name(name))
+    return captions.status(name)
 
 
 @app.delete("/api/datasets/{name}/item/{filename}")
@@ -760,10 +1044,36 @@ async def generate(request: Request):
         path = resolve_lora(str(lr.get("id", "")))
         loras.append({"id": lr["id"], "path": str(path), "name": lr.get("name") or path.stem,
                       "strength": max(-4.0, min(4.0, float(lr.get("strength", 1.0))))})
-    rid = gen_manager.submit({"model": model, "prompt": prompt, "negative": str(body.get("negative", "")),
-                              "width": width, "height": height, "steps": steps, "cfg": cfg, "shift": shift,
-                              "seed": seed, "count": count, "skip_layer": skip, "loras": loras})
-    return {"id": rid}
+    req = {"model": model, "prompt": prompt, "negative": str(body.get("negative", "")), "width": width,
+           "height": height, "steps": steps, "cfg": cfg, "shift": shift, "seed": seed, "count": count,
+           "skip_layer": skip, "loras": loras}
+    if body.get("image"):  # a source image to edit
+        if not MODEL_SPECS[model].get("edit"):
+            raise HTTPException(400, "This model can't edit images; remove the source image")
+        src = safe_file(INPUTS, str(body["image"]))
+        if not src.exists():
+            raise HTTPException(400, "The source image is gone; upload it again")
+        req.update(image=str(src), image_id=src.name)
+    return {"id": gen_manager.submit(req)}
+
+
+@app.post("/api/generate/input")
+async def upload_input(file: UploadFile = File(...)):
+    """A source image for editing (Fibo 2.0)."""
+    name = _clean_name(file.filename or "image.png")
+    if Path(name).suffix not in IMAGE_EXTS:
+        raise HTTPException(400, "Upload an image")
+    target = _unique(INPUTS, name)
+    target.write_bytes(await file.read())
+    return {"id": target.name}
+
+
+@app.get("/api/generations/input/{filename}")
+def generation_input(filename: str):
+    path = safe_file(INPUTS, filename)
+    if not path.exists():
+        raise HTTPException(404)
+    return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
 
 
 @app.get("/api/generate/status")

@@ -73,7 +73,12 @@ class Job:
 
 def sample_sigmas(n: int, t: dict, device, tokens: int = 4096) -> torch.Tensor:
     mode = t["timestep_sampling"]
-    if mode == "flux_shift":
+    if mode == "fibo":
+        # Bria's Fibo 2.0 trainer: sigmoid(N(mu, 1)) with the resolution shift mu, mixed with 10% uniform.
+        from .backends import Fibo2Backend
+        mu = Fibo2Backend.calculate_mu(tokens)
+        sig = torch.where(torch.rand(n) < 0.1, torch.rand(n), torch.sigmoid(torch.randn(n) + mu))
+    elif mode == "flux_shift":
         # FLUX / Krea 2: logit-normal u, then the resolution-aware exponential shift used at inference.
         from .backends import Krea2Backend
         u = torch.sigmoid(torch.randn(n) * t["logit_std"] + t["logit_mean"]).clamp(1e-4, 1 - 1e-4)
@@ -161,8 +166,9 @@ def run(job: Job):
     job.log("buckets: " + ", ".join(f"{w}x{h}:{n}" for (w, h), n in sorted(buckets.items())))
 
     sample_prompts = [apply_trigger(p, cfg["trigger_word"]) for p in sc["prompts"]]
-    neg_prompt = sc["negative_prompt"]
-    prompts = {it.caption for it in items} | {"", neg_prompt} | set(sample_prompts)
+    neg_prompt = backend.negative_prompt(sc["negative_prompt"])
+    early = {p: backend.prompt_parts(p)[1] for p in {it.caption for it in items} | set(sample_prompts)}
+    prompts = set(early) | {backend.empty_prompt, neg_prompt} | {e for e in early.values() if e}
 
     # ---- text embeddings (Qwen3.5-9B is loaded only if something is missing, then freed)
     text_cache = TextCache(cache_root / "text", backend.text_cache_id)
@@ -225,10 +231,11 @@ def run(job: Job):
         index = [e for e in index if e["step"] != at_step]
         for i, prompt in enumerate(sample_prompts):
             job.set(state="sampling", message=f"Sample {i + 1}/{len(sample_prompts)}")
+            extra = {"early": text_cache.get(early[prompt])} if early[prompt] else {}
             img = backend.sample(transformer, vae, text_cache.get(prompt), text_cache.get(neg_prompt),
                                  width=sc["width"], height=sc["height"], steps=sc["steps"], cfg=sc["cfg"],
                                  seed=sc["seed"] + i, shift=sc["shift"], skip_layer=sc["uncond_skip_layer"],
-                                 device=device)
+                                 device=device, **extra)
             fname = f"{at_step:06d}_{i:02d}.jpg"
             img.save(job.samples_dir / fname, quality=92)
             index.append({"step": at_step, "index": i, "prompt": prompt, "file": fname})
@@ -242,7 +249,8 @@ def run(job: Job):
         meta = {"ss_base_model": cfg["model"], "ss_steps": str(at_step), "ss_trigger": cfg["trigger_word"],
                 "ss_network_rank": str(net["rank"]), "ss_network_alpha": str(net["alpha"]),
                 "moss_trainer_config": cfg}
-        lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype, backend.lora_format)
+        lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype, backend.lora_format,
+                      backend.lora_arch)
         torch.save({
             "lora": {**{k + ".A": m.lora_A.weight.detach().cpu() for k, m in modules.items()},
                      **{k + ".B": m.lora_B.weight.detach().cpu() for k, m in modules.items()}},
@@ -263,7 +271,7 @@ def run(job: Job):
     latent_mem: dict[str, torch.Tensor] = {}
     metrics = open(job.dir / "metrics.jsonl", "a")
     times = deque(maxlen=20)
-    autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+    autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda" and backend.use_autocast)
     drop = cfg["data"]["caption_dropout"]
     job.log(f"training {t['steps']} steps, {len(sampler)} batches/epoch")
     job.set(state="training", message="", step=step)
@@ -282,10 +290,13 @@ def run(job: Job):
                     latent_mem[key] = load_latent(it)
                 lats.append(latent_mem[key])
             x0 = torch.stack(lats).to(device, torch.float32)
-            caps = ["" if random.random() < drop else it.caption for it in batch]
-            embeds, mask = pad_embeds([text_cache.get(c) for c in caps], device)
             noise = torch.randn_like(x0)
             sig = sample_sigmas(len(batch), t, device, backend.tokens(x0))
+            # Fibo 2.0: above noise level 0.9 a caption is seen without the images of its text, as at inference.
+            caps = [backend.empty_prompt if random.random() < drop
+                    else early[it.caption] if early[it.caption] and s > 0.9 else it.caption
+                    for it, s in zip(batch, sig.tolist())]
+            embeds, mask = pad_embeds([text_cache.get(c) for c in caps], device)
             s = sig.view(-1, 1, 1, 1)
             noisy = (1 - s) * x0 + s * noise
             with autocast:

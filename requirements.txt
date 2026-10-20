@@ -1,6 +1,7 @@
 # torch is installed separately by setup.sh (CUDA 12.8+ wheels for Blackwell / RTX PRO 6000)
-diffusers>=0.38
-transformers>=5.3
+# BriaFibo2Pipeline (Fibo 2.0) is on diffusers main, not in a release yet (merged in huggingface/diffusers#14991)
+diffusers @ git+https://github.com/huggingface/diffusers@de988b7ee77c393a63865d265d19e267ef9c7bf5
+transformers>=5.19
 accelerate>=1.10
 safetensors>=0.6
 huggingface_hub[hf_xet]>=0.34

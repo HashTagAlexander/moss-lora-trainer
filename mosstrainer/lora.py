@@ -1,9 +1,9 @@
-"""Minimal LoRA for MOSS-Image and Krea 2, saved in ComfyUI/diffusers-loadable formats.
+"""Minimal LoRA for MOSS-Image, Krea 2 and Fibo 2.0, saved in ComfyUI/diffusers-loadable formats.
 
 MOSS-Image ("moss" format): ``diffusion_model.layers.0.proj.q.lora_A.weight`` / ``lora_B.weight`` / ``alpha``,
 which ComfyUI's generic LoRA loader maps onto the MOSS-Image diffusion model.
-Krea 2 ("diffusers" format): ``transformer.transformer_blocks.0.attn.to_q.lora_A.weight`` / ``lora_B.weight``
-with alpha/rank folded into lora_B, loadable by diffusers' Krea2Pipeline and ComfyUI.
+Krea 2 / Fibo 2.0 ("diffusers" format): ``transformer.<module>.lora_A.weight`` / ``lora_B.weight`` with alpha/rank
+folded into lora_B, loadable by the diffusers pipelines (``pipe.transformer.load_lora_adapter``) and ComfyUI.
 """
 from __future__ import annotations
 
@@ -113,8 +113,8 @@ def state_dict(modules: dict[str, LoRALinear], dtype=torch.bfloat16, fmt: str = 
     return sd
 
 
-def save(modules, path, metadata: dict | None = None, dtype=torch.bfloat16, fmt: str = "moss"):
-    arch = "krea2/lora" if fmt == "diffusers" else "moss-image/lora"
+def save(modules, path, metadata: dict | None = None, dtype=torch.bfloat16, fmt: str = "moss", arch: str = ""):
+    arch = arch or ("krea2/lora" if fmt == "diffusers" else "moss-image/lora")
     meta = {"format": "pt", "modelspec.architecture": arch}
     for k, v in (metadata or {}).items():
         meta[k] = v if isinstance(v, str) else json.dumps(v)
@@ -155,9 +155,23 @@ def merge_file_into(model: nn.Module, path, multiplier: float = 1.0) -> int:
 
 # --------------------------------------------------------------------------- inference-time stacking
 
+def _peft_alpha(path) -> float | None:
+    """lora_alpha from diffusers/PEFT adapter metadata (e.g. Bria's Fibo 2.0 trainer), which has no alpha keys."""
+    from safetensors import safe_open
+    with safe_open(str(path), "pt") as f:
+        raw = (f.metadata() or {}).get("lora_adapter_metadata")
+    try:
+        meta = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return None
+    alpha = meta.get("transformer.lora_alpha", meta.get("lora_alpha"))
+    return float(alpha) if alpha else None
+
+
 def read_lora_file(path) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
     """Return {module_name: (A, B, alpha/rank)} for lora_A/lora_B or lora_down/lora_up files."""
     sd = load_file(str(path))
+    peft_alpha = _peft_alpha(path)
     out = {}
     for key in sd:
         for down, up in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight")):
@@ -170,6 +184,8 @@ def read_lora_file(path) -> dict[str, tuple[torch.Tensor, torch.Tensor, float]]:
             a = sd[key]
             alpha = sd.get(name + ".alpha")
             rank = a.shape[0]
+            if alpha is None and peft_alpha:
+                alpha = peft_alpha
             scale = (float(alpha) / rank) if alpha is not None else 1.0
             for prefix in ("model.diffusion_model.", PREFIX, "transformer.", "base_model.model."):
                 if name.startswith(prefix):

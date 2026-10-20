@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import random
-from collections import defaultdict
+import re
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,8 +33,42 @@ def read_caption(image: Path) -> str:
     return txt.read_text(encoding="utf-8").strip() if txt.exists() else ""
 
 
+def json_caption(caption: str) -> dict | None:
+    """The caption as a JSON object (a structured VGL caption for Fibo 2.0), or None for plain text."""
+    if not caption.lstrip().startswith("{"):
+        return None
+    try:
+        obj = json.loads(caption)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _trigger_json(caption: dict, trigger: str) -> str:
+    """[trigger] is replaced in every string; otherwise the trigger leads the short_description."""
+    def walk(v):
+        if isinstance(v, str):
+            v = v.replace("[trigger]", trigger)
+            return v if trigger else re.sub(r"^\s*,\s*", "", v).strip()
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+    had = "[trigger]" in json.dumps(caption, ensure_ascii=False)
+    caption = walk(caption)
+    if trigger and not had and trigger not in json.dumps(caption, ensure_ascii=False):
+        sd = str(caption.get("short_description") or "").strip()
+        caption = {"short_description": f"{trigger}, {sd}" if sd else trigger,
+                   **{k: v for k, v in caption.items() if k != "short_description"}}
+    return json.dumps(caption, ensure_ascii=False, separators=(",", ":"))
+
+
 def apply_trigger(caption: str, trigger: str) -> str:
     trigger = (trigger or "").strip()
+    obj = json_caption(caption)
+    if obj is not None:
+        return _trigger_json(obj, trigger)
     if not trigger:
         return caption.replace("[trigger]", "").strip()
     if "[trigger]" in caption:
@@ -116,11 +152,14 @@ def cache_latents(items: list[Item], vae, cache_dir: Path, progress=None, encode
 
 
 class TextCache:
-    def __init__(self, cache_dir: Path, model_id: str):
+    """Prompt embeddings on disk, with the most recently used kept in RAM (Fibo 2.0's are ~100 MB each)."""
+
+    def __init__(self, cache_dir: Path, model_id: str, max_bytes: int = 8 << 30):
         self.dir = cache_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self.model_id = model_id
-        self.mem: dict[str, torch.Tensor] = {}
+        self.mem: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.max_bytes = max_bytes
 
     def path(self, prompt: str) -> Path:
         return self.dir / f"{text_key(self.model_id, prompt)}.safetensors"
@@ -137,9 +176,16 @@ class TextCache:
         return len(todo)
 
     def get(self, prompt: str) -> torch.Tensor:
-        if prompt not in self.mem:
-            self.mem[prompt] = load_file(str(self.path(prompt)))["embeds"]
-        return self.mem[prompt]
+        if prompt in self.mem:
+            self.mem.move_to_end(prompt)
+            return self.mem[prompt]
+        emb = load_file(str(self.path(prompt)))["embeds"]
+        self.mem[prompt] = emb
+        size = lambda t: t.numel() * t.element_size()  # noqa: E731
+        total = sum(size(t) for t in self.mem.values())
+        while total > self.max_bytes and len(self.mem) > 1:
+            total -= size(self.mem.popitem(last=False)[1])
+        return emb
 
 
 class BucketSampler:

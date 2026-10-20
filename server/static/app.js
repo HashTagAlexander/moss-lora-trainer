@@ -167,6 +167,7 @@ const routes = [
   [/^\/datasets$/, "datasets", pageDatasets],
   [/^\/datasets\/([^/]+)$/, "datasets", pageDataset],
   [/^\/generate$/, "generate", pageGenerate],
+  [/^\/settings$/, "settings", pageSettings],
 ];
 
 async function route() {
@@ -334,8 +335,16 @@ function lossChart(el) {
 }
 
 // ------------------------------------------------------------------ job page
+const CKPT_NOTE = {
+  moss: 'LoRA files use ComfyUI-compatible keys (<span class="mono">diffusion_model.layers.N.proj.*</span>). Load with a standard LoraLoaderModelOnly node on top of the MOSS-Image loader, or use <span class="mono">generate.py</span>.',
+  krea2: 'LoRA files are in diffusers format (<span class="mono">transformer.transformer_blocks.N.*</span>), loadable by diffusers\' Krea2Pipeline and ComfyUI.',
+  fibo2: 'LoRA files are in diffusers format (<span class="mono">transformer.layers.N.*</span>). Load with <span class="mono">pipe.transformer.load_lora_adapter(folder, weight_name="&lt;file&gt;.safetensors")</span> on BriaFibo2Pipeline; they work on Fibo 2.0 Dev and Edit Turbo.',
+};
+
 async function pageJob(name) {
+  if (!INFO) INFO = await api("/api/info");
   let job = await api(`/api/jobs/${enc(name)}`);
+  const family = (INFO.model_specs[job.config.model] || {}).family;
   const base = `/api/jobs/${enc(name)}`;
   let tab = "overview";
   view.innerHTML = `
@@ -411,8 +420,7 @@ async function pageJob(name) {
     el.innerHTML = `<table><thead><tr><th>File</th><th>Size</th><th>Saved</th><th></th></tr></thead><tbody>
       ${job.checkpoints.slice().sort((a, b) => b.mtime - a.mtime).map((c) => `<tr><td class="mono">${esc(c.file)}</td><td class="muted">${fmtBytes(c.size)}</td>
       <td class="muted">${timeAgo(c.mtime)}</td><td style="text-align:right"><a class="btn btn-sm" href="#/generate?lora=${enc(`jobs/${name}/checkpoints/${c.file}`)}">${I.spark} Generate</a> <a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}" download>${I.download} Download</a></td></tr>`).join("")}
-      </tbody></table><div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">
-      LoRA files use ComfyUI-compatible keys (<span class="mono">diffusion_model.layers.N.proj.*</span>). Load with a standard LoraLoaderModelOnly node on top of the MOSS-Image loader, or use <span class="mono">generate.py</span>.</div>`;
+      </tbody></table><div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">${CKPT_NOTE[family] || CKPT_NOTE.moss}</div>`;
   }
 
   function renderStatus() {
@@ -552,10 +560,13 @@ async function pageNewJob(params) {
   } else if (params.dataset) cfg.dataset = params.dataset;
   if (!cfg.dataset && datasets.length) cfg.dataset = datasets[0].name;
 
+  const targetsField = (model) => F.chips("network.targets", "Target modules",
+    Object.entries(INFO.families[(INFO.model_specs[model] || {}).family] || {}),
+    (INFO.model_specs[model] || {}).family === "fibo2" ? "Bria's recipe trains all four (every Linear layer)." : "");
   const sections = [
     ["Job", [
       F.text("name", "Job name", "Also used as the LoRA filename.", mode === "edit" ? "readonly" : ""),
-      F.sel("model", "Base model", Object.entries(INFO.trainable), "Changing it loads that model's recommended sampling settings."),
+      F.sel("model", "Base model", Object.entries(INFO.trainable), "Changing it loads that model's recommended settings. Gated models (Fibo 2.0) need a Hugging Face token in <a href=\"#/settings\">Settings</a>."),
       F.sel("dataset", "Dataset", datasets.length ? datasets.map((d) => [d.name, `${d.name} (${d.count} images)`]) : [["", "— create a dataset first —"]],
         `<a href="#/datasets">Manage datasets</a>`),
       F.text("trigger_word", "Trigger word", "Prepended to captions; replaces <span class='mono'>[trigger]</span> in captions and sample prompts."),
@@ -564,8 +575,8 @@ async function pageNewJob(params) {
       F.num("network.rank", "Rank", "16–64 is typical for characters / styles.", 'min="1" max="512"'),
       F.num("network.alpha", "Alpha", "Scale = alpha / rank.", 'step="any"'),
       F.num("network.dropout", "Dropout", "", 'step="0.01" min="0" max="0.5"'),
-      F.text("network.layers", "Blocks", "Blank = all 42 blocks; or e.g. <span class='mono'>0-20,30</span>."),
-      F.chips("network.targets", "Target modules", [["attn", "Attention (q, k, v, o)"], ["ffn", "Feed-forward"], ["text", "Text refiner blocks"]]),
+      F.text("network.layers", "Blocks", "Blank = all blocks; or e.g. <span class='mono'>0-20,30</span>."),
+      targetsField(cfg.model),
     ]],
     ["Dataset", [
       F.chips("data.resolutions", "Training resolutions", [[512, "512"], [768, "768"], [1024, "1024"], [1280, "1280"], [1536, "1536"]],
@@ -588,7 +599,7 @@ async function pageNewJob(params) {
       F.bool("train.gradient_checkpointing", "Gradient checkpointing", "Saves VRAM at ~25% speed cost. 96 GB cards can usually turn this off at 1024."),
     ]],
     ["Timesteps", [
-      F.sel("train.timestep_sampling", "Timestep sampling", [["moss", "MOSS pretraining (truncated logit-normal)"], ["flux_shift", "Resolution-shifted logit-normal (Krea 2 / FLUX)"], ["logit_normal", "Logit-normal"], ["shift", "Shifted uniform"], ["uniform", "Uniform"]],
+      F.sel("train.timestep_sampling", "Timestep sampling", [["moss", "MOSS pretraining (truncated logit-normal)"], ["flux_shift", "Resolution-shifted logit-normal (Krea 2 / FLUX)"], ["fibo", "Fibo 2.0 (Bria: shifted logit-normal + 10% uniform)"], ["logit_normal", "Logit-normal"], ["shift", "Shifted uniform"], ["uniform", "Uniform"]],
         "MOSS = the distribution from the final pretraining stage (tech report, Table 6)."),
       F.num("train.shift", "Shift", "For “Shifted uniform”.", 'step="any"'),
       F.num("train.logit_mean", "Logit mean", "For “Logit-normal”.", 'step="any"'),
@@ -609,8 +620,8 @@ async function pageNewJob(params) {
       F.num("sample.seed", "Seed"),
       F.num("sample.uncond_skip_layer", "Uncond skip layer", "MOSS only: negative-branch layer skip (default 22, −1 off)."),
       F.bool("sample.sample_first", "Sample before training", "Baseline images at step 0."),
-      F.area("sample.prompts", "Sample prompts", "One per line. <span class='mono'>[trigger]</span> is replaced by your trigger word."),
-      { path: "sample.negative_prompt", label: "Negative prompt", help: "Leave empty to match the official default.", type: "text", attrs: "", full: true },
+      F.area("sample.prompts", "Sample prompts", "One per line. <span class='mono'>[trigger]</span> is replaced by your trigger word. Fibo 2.0 works best with one-line VGL JSON captions."),
+      { path: "sample.negative_prompt", label: "Negative prompt", help: "Leave empty to match the official default (Fibo 2.0: the empty VGL caption).", type: "text", attrs: "", full: true },
     ]],
   ];
 
@@ -624,19 +635,53 @@ async function pageNewJob(params) {
       <button class="btn" id="save">Save</button><button class="btn btn-primary" id="save-start">${I.play} Save & start</button></div>`;
 
   const form = $("#form");
+  let prevModel = cfg.model;
+  // A model's training overrides and default negative, as {path: value}.
+  const modelPaths = (model) => {
+    const spec = INFO.model_specs[model] || {}, out = {};
+    const walk = (o, pre) => Object.entries(o || {}).forEach(([k, v]) => (v && typeof v === "object" && !Array.isArray(v) ? walk(v, `${pre}${k}.`) : (out[pre + k] = v)));
+    walk(spec.overrides, "");
+    out["sample.negative_prompt"] = (spec.defaults || {}).negative || "";
+    return out;
+  };
   form.addEventListener("change", (e) => {
     if (e.target.dataset.path !== "model") return;
-    const d = (INFO.model_specs[e.target.value] || {}).defaults || {};
+    const model = e.target.value;
+    const d = (INFO.model_specs[model] || {}).defaults || {};
     const set = (path, v) => { const el = $(`[data-path="${path}"]`, form); if (el && v !== undefined) el.value = v; };
     set("sample.steps", d.steps); set("sample.cfg", d.cfg); set("sample.shift", d.shift);
     set("sample.uncond_skip_layer", d.skip_layer); set("train.timestep_sampling", d.timestep_sampling);
-    toast("Loaded the recommended sampling settings for this model", "ok");
+    // Swap in the new model's overrides wherever the field still holds the previous model's value.
+    const prev = modelPaths(prevModel), next = modelPaths(model), cur = readForm(form, {});
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    for (const path of new Set([...Object.keys(prev), ...Object.keys(next)])) {
+      const was = path in prev ? prev[path] : getPath(INFO.defaults, path);
+      const now = path in next ? next[path] : getPath(INFO.defaults, path);
+      if (!same(getPath(cur, path), was)) continue;
+      setPath(cur, path, now);
+      const el = $(`[data-path="${path}"]`, form);
+      if (!el || el.dataset.type === "chips") continue;
+      if (el.dataset.type === "lines") el.value = (now || []).join("\n");
+      else if (el.dataset.type === "bool") el.checked = !!now;
+      else el.value = now ?? "";
+    }
+    // Target groups differ per model family.
+    const options = Object.keys(INFO.families[(INFO.model_specs[model] || {}).family] || {});
+    let targets = (getPath(cur, "network.targets") || []).filter((t) => options.includes(t));
+    if (!targets.length) targets = getPath(INFO.defaults, "network.targets").filter((t) => options.includes(t));
+    const chips = $('[data-path="network.targets"]', form).closest(".field.full");
+    chips.outerHTML = renderField(targetsField(model), { network: { targets } });
+    prevModel = model;
+    toast("Loaded the recommended settings for this model", "ok");
   });
   form.addEventListener("click", (e) => { const c = e.target.closest(".chip"); if (c) c.classList.toggle("on"); });
   $("#json-mode").onchange = (e) => {
     if (e.target.checked) { $("#json").value = JSON.stringify(readForm(form, cfg), null, 2); }
     else {
       try { cfg = JSON.parse($("#json").value); } catch (err) { toast("Invalid JSON: " + err.message, "error"); e.target.checked = true; return; }
+      const net = sections.find(([t]) => t === "Network")[1];
+      net[net.findIndex((f) => f.path === "network.targets")] = targetsField(cfg.model);
+      prevModel = cfg.model;
       form.innerHTML = sections.map(([t, fields]) => `<div class="card form-section"><div class="card-head"><h3>${t}</h3></div><div class="card-body">${fields.map((f) => renderField(f, cfg)).join("")}</div></div>`).join("");
     }
     form.hidden = e.target.checked; $("#json-wrap").hidden = !e.target.checked;
@@ -680,13 +725,16 @@ async function pageDataset(name) {
     <div class="page-head"><div><h1>${esc(name)}</h1><div class="sub" id="ds-sub"></div></div>
       <div class="row">
         <select id="bulk" style="width:auto"><option value="">Bulk caption…</option><option value="prepend">Prepend text</option><option value="append">Append text</option><option value="replace">Find & replace</option><option value="fill_empty">Fill empty captions</option></select>
+        <button class="btn" id="vlm" title="Write Fibo 2.0 VGL captions with a vision model (OpenRouter)">${I.spark} Caption with AI</button>
         <a class="btn btn-primary" href="#/new?dataset=${enc(name)}">${I.flask} Train on this</a>
         <button class="btn btn-ghost btn-danger" id="del-ds">${I.trash}</button></div></div>
-    <div class="dropzone" id="drop">${I.upload}<div><b>Drop images, .txt captions or a .zip here</b></div><div class="faint" style="font-size:12px">or click to browse · captions pair with images by filename</div>
-      <input type="file" id="file" multiple accept="image/*,.txt,.zip" hidden></div>
+    <div class="dropzone" id="drop">${I.upload}<div><b>Drop images, .txt/.json captions or a .zip here</b></div><div class="faint" style="font-size:12px">or click to browse · captions pair with images by filename</div>
+      <input type="file" id="file" multiple accept="image/*,.txt,.json,.zip" hidden></div>
+    <div id="cap-run"></div>
     <div style="height:18px"></div><div class="items" id="items"></div>`;
 
   let items = [];
+  const isJson = (s) => s.trimStart().startsWith("{");
   async function load() {
     const d = await api(base);
     items = d.items;
@@ -695,8 +743,9 @@ async function pageDataset(name) {
     $("#items").innerHTML = items.length ? items.map((it, i) => `
       <div class="item ${it.caption.trim() ? "" : "nocap"}" data-file="${esc(it.file)}">
         <div class="img-wrap"><img loading="lazy" src="${base}/image/${enc(it.file)}?thumb=1&v=${it.mtime}" data-i="${i}">
+          <button class="btn btn-sm vlm" data-vlm="${esc(it.file)}" title="Caption this image with AI (VGL)">${I.spark}</button>
           <button class="btn btn-sm del" data-del="${esc(it.file)}">${I.trash}</button></div>
-        <textarea placeholder="Write a caption…">${esc(it.caption)}</textarea>
+        <textarea placeholder="Write a caption…" class="${isJson(it.caption) ? "json" : ""}">${esc(it.caption)}</textarea>
         <div class="meta"><span title="${esc(it.file)}">${esc(it.file.length > 28 ? it.file.slice(0, 25) + "…" : it.file)}</span><span class="state">${fmtBytes(it.size)}</span></div></div>`).join("")
       : `<div class="faint" style="grid-column:1/-1;text-align:center;padding:20px">Empty dataset</div>`;
   }
@@ -746,6 +795,13 @@ async function pageDataset(name) {
     if (card && e.target.tagName === "TEXTAREA" && timers.has(card)) { clearTimeout(timers.get(card)); timers.delete(card); saveCaption(card); }
   });
   $("#items").addEventListener("click", async (e) => {
+    const one = e.target.closest("[data-vlm]");
+    if (one) {
+      if (!(await needOpenRouterKey())) return;
+      await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: "files", files: [one.dataset.vlm] } }));
+      one.closest(".item").classList.add("captioning");
+      return pollCaptions();
+    }
     const del = e.target.closest("[data-del]");
     if (del) {
       if (!(await confirmBox("Delete image?", `Delete ${del.dataset.del} and its caption.`))) return;
@@ -774,6 +830,72 @@ async function pageDataset(name) {
     await guard(() => api(base, { method: "DELETE" }), "Dataset deleted");
     location.hash = "#/datasets";
   };
+
+  // ---- AI captions (VGL for Fibo 2.0, via OpenRouter)
+  async function needOpenRouterKey() {
+    const s = await api("/api/settings");
+    if (s.has_openrouter_key) return s;
+    await modal({ title: "OpenRouter key needed", confirm: "Open Settings",
+      body: `<p class="muted" style="margin:0">AI captioning sends each image to a vision model through <a href="https://openrouter.ai" target="_blank" rel="noopener">OpenRouter</a>. Add your OpenRouter API key in Settings first.</p>` })
+      .then((v) => { if (v) location.hash = "#/settings"; });
+    return null;
+  }
+  $("#vlm").onclick = async () => {
+    const s = await needOpenRouterKey();
+    if (!s) return;
+    const missing = items.filter((i) => !i.caption.trim()).length;
+    const v = await modal({ title: "Caption with AI", confirm: "Start captioning", body: `
+      <p class="muted" style="margin:0 0 12px">Writes a structured <a href="https://docs.bria.ai/vgl" target="_blank" rel="noopener">VGL</a> caption (JSON) for each image, the format Fibo 2.0 is trained on, using <span class="mono">${esc(s.caption_model)}</span>. Your trigger word is added to the short description at training time.</p>
+      <label class="field">Images<select name="scope">
+        <option value="missing">Images without a caption (${missing})</option>
+        <option value="all">All images (${items.length}), replacing existing captions</option></select></label>
+      <label class="field" style="margin-top:12px">Extra instructions <span class="help">Optional, e.g. “The woman in every photo is called Mira.”</span>
+        <textarea name="extra" rows="3"></textarea></label>` });
+    if (!v) return;
+    await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: v.scope, extra: v.extra } }), "Captioning started");
+    pollCaptions();
+  };
+
+  let capTimer = null, seen = 0, runStarted = null;
+  async function pollCaptions() {
+    const st = await api(`${base}/autocaption`);
+    const el = $("#cap-run");
+    if (!el) return;
+    if (st.state === "idle") { el.innerHTML = ""; return; }
+    if (st.started !== runStarted) { runStarted = st.started; seen = 0; }
+    // Fill in captions as they land, without touching a caption being edited.
+    if (st.finished && st.finished.length > seen) {
+      const fresh = st.finished.slice(seen);
+      seen = st.finished.length;
+      const d = await api(base);
+      for (const f of fresh) {
+        const it = d.items.find((x) => x.file === f), card = $$("#items .item").find((c) => c.dataset.file === f);
+        const local = items.find((x) => x.file === f);
+        if (local && it) local.caption = it.caption;
+        if (!card || !it) continue;
+        card.classList.remove("captioning", "nocap");
+        const ta = $("textarea", card);
+        if (document.activeElement !== ta) { ta.value = it.caption; ta.classList.toggle("json", isJson(it.caption)); }
+      }
+      const cap = items.filter((i) => i.caption.trim()).length;
+      $("#ds-sub").textContent = `${items.length} images · ${cap} captioned${items.length - cap ? ` · ${items.length - cap} missing captions` : ""}`;
+    }
+    const running = st.state === "running";
+    const pctDone = st.total ? (100 * (st.done + st.failed)) / st.total : 0;
+    el.innerHTML = `<div class="card cap-run"><div class="card-body">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <div>${running ? `Captioning with <span class="mono">${esc(st.model)}</span>…` : st.state === "cancelled" ? "Captioning stopped" : "Captioning finished"}
+          <span class="muted">${st.done}/${st.total} done${st.failed ? `, ${st.failed} failed` : ""}</span></div>
+        ${running ? `<button class="btn btn-sm" id="cap-cancel">${I.stop} Stop</button>` : `<button class="btn btn-sm btn-ghost" id="cap-close">${I.x}</button>`}</div>
+      <div class="progress big"><div style="width:${pctDone.toFixed(1)}%"></div></div>
+      ${st.errors && st.errors.length ? `<div class="errors">${st.errors.slice(-5).map((x) => `<div>${esc(x)}</div>`).join("")}</div>` : ""}</div></div>`;
+    $("#cap-cancel")?.addEventListener("click", () => api(`${base}/autocaption/cancel`, { method: "POST" }).then(pollCaptions));
+    $("#cap-close")?.addEventListener("click", () => { el.innerHTML = ""; });
+    if (!running) $$("#items .item.captioning").forEach((c) => c.classList.remove("captioning"));
+    clearTimeout(capTimer);
+    if (running) capTimer = setTimeout(() => { if (document.body.contains(el)) pollCaptions(); }, 1500);
+  }
+  api(`${base}/autocaption`).then((st) => { if (st.state === "running") pollCaptions(); });
 }
 
 
@@ -791,7 +913,7 @@ async function pageGenerate(params) {
   if (!INFO) INFO = await api("/api/info");
   let loras = await api("/api/loras");
   const defaults = { prompt: "", negative: "", loras: [], aspect: "1:1", mp: 1, width: 1024, height: 1024, steps: 50,
-    cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model };
+    cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model, image: "" };
   const st = { ...defaults, ...loadGenState() };
   st.loras = (st.loras || []).filter((l) => loras.some((x) => x.id === l.id));
   if (params.lora) {
@@ -805,12 +927,15 @@ async function pageGenerate(params) {
   const loraInfo = (id) => loras.find((x) => x.id === id) || { label: id.split("/").pop(), trigger: "" };
 
   view.innerHTML = `
-    <div class="page-head"><div><h1>Generate</h1><div class="sub">Try your LoRAs with the official MOSS-Image sampler</div></div>
+    <div class="page-head"><div><h1>Generate</h1><div class="sub">Try your LoRAs with each model's official sampler</div></div>
       <div class="row" id="g-worker"></div></div>
     <div class="gen-layout">
       <div class="card gen-controls"><div class="card-body gen-form">
         <label class="field">Prompt<textarea id="g-prompt" rows="5" placeholder="Describe the image… (⌘/Ctrl + Enter to generate)"></textarea></label>
         <label class="field">Negative prompt<textarea id="g-negative" rows="2" placeholder="Optional, e.g. worst quality, bad anatomy, watermark"></textarea></label>
+        <div class="field" id="g-src-field" hidden><div class="row" style="justify-content:space-between"><span>Source image <span class="help">optional: edit this image</span></span>
+          <label class="btn btn-sm btn-ghost" style="cursor:pointer">${I.upload} Upload<input type="file" id="g-src-file" accept="image/*" hidden></label></div>
+          <div id="g-src"></div></div>
         <div class="field"><div class="row" style="justify-content:space-between"><span>LoRAs</span>
           <label class="btn btn-sm btn-ghost" style="cursor:pointer" title="Upload a .safetensors LoRA">${I.upload} Upload<input type="file" id="g-upload" accept=".safetensors" multiple hidden></label></div>
           <div id="g-loras" class="lora-list"></div>
@@ -864,9 +989,37 @@ async function pageGenerate(params) {
     const d = (INFO.model_specs[st.model] || {}).defaults || {};
     Object.assign(st, { steps: d.steps ?? st.steps, cfg: d.cfg ?? st.cfg, shift: d.shift ?? st.shift, skip_layer: d.skip_layer ?? st.skip_layer });
     for (const k of ["steps", "cfg", "shift", "skip_layer"]) $(fields[k]).value = st[k];
-    saveGenState(st); renderLoras(); renderModelBadge();
+    const prevNeg = ((INFO.model_specs[prevModel] || {}).defaults || {}).negative || "";
+    if (st.negative === prevNeg) { st.negative = d.negative || ""; $("#g-negative").value = st.negative; }
+    prevModel = st.model;
+    saveGenState(st); renderLoras(); renderModelBadge(); renderSource();
     toast("Loaded the recommended settings for this model", "ok");
   };
+  let prevModel = st.model;
+
+  // ---- source image (Fibo 2.0 edits)
+  function renderSource() {
+    const edit = !!(INFO.model_specs[st.model] || {}).edit;
+    $("#g-src-field").hidden = !edit;
+    $("#g-prompt").placeholder = edit
+      ? (st.image ? "The edit instruction, e.g. “Make the jacket red leather”… (⌘/Ctrl + Enter)" : "Describe the image, or paste a VGL JSON caption… (⌘/Ctrl + Enter)")
+      : "Describe the image… (⌘/Ctrl + Enter to generate)";
+    $("#g-src").innerHTML = st.image
+      ? `<div class="src-img"><img src="/api/generations/input/${enc(st.image)}"><button class="btn btn-sm" id="g-src-remove" title="Remove">${I.x}</button></div>
+         <div class="help" style="margin-top:4px">The result keeps the source's aspect ratio at about the size set below.${st.model.includes("turbo") ? "" : " Edit Turbo does this in 4 steps."}</div>`
+      : `<div class="faint" style="font-size:12px">None: text-to-image${st.model.includes("turbo") ? ". Edit Turbo is made for editing; text-to-image works best on Fibo 2.0 Dev." : ""}</div>`;
+  }
+  renderSource();
+  $("#g-src-file").onchange = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const fd = new FormData();
+    fd.append("file", f);
+    const r = await guard(() => api("/api/generate/input", { method: "POST", body: fd }));
+    st.image = r.id; saveGenState(st); renderSource();
+    e.target.value = "";
+  };
+  $("#g-src").onclick = (e) => { if (e.target.closest("#g-src-remove")) { st.image = ""; saveGenState(st); renderSource(); } };
   $("#g-mp").onchange = (e) => { st.mp = +e.target.value; applyAspect(); saveGenState(st); };
   $("#g-aspects").onclick = (e) => {
     const c = e.target.closest("[data-aspect]");
@@ -937,6 +1090,7 @@ async function pageGenerate(params) {
   // ---- submit
   async function submit() {
     const body = { ...st, loras: st.loras.map((l) => ({ id: l.id, strength: l.strength, name: loraInfo(l.id).label })) };
+    if (!(INFO.model_specs[st.model] || {}).edit) delete body.image;
     await guard(() => api("/api/generate", { method: "POST", body }));
     refreshStatus();
   }
@@ -978,7 +1132,7 @@ async function pageGenerate(params) {
   // ---- gallery
   let items = [], lastVersion = null, limit = 60;
   const fileUrl = (f) => `/api/generations/file/${enc(f)}`;
-  const describe = (it) => [`seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
+  const describe = (it) => [...(it.image_id ? ["edit"] : []), `seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
     ...(it.loras || []).map((l) => `${l.name} @ ${l.strength}`)].join(" · ");
   async function loadGallery() {
     const r = await api(`/api/generations?limit=${limit}`);
@@ -1000,11 +1154,11 @@ async function pageGenerate(params) {
     if (reuse) {
       const it = items[+reuse.dataset.reuse];
       Object.assign(st, { prompt: it.prompt, negative: it.negative || "", width: it.width, height: it.height, steps: it.steps,
-        cfg: it.cfg, shift: it.shift ?? 5, skip_layer: it.skip_layer ?? 22, seed: it.seed, model: it.model || st.model, aspect: "",
+        cfg: it.cfg, shift: it.shift ?? 5, skip_layer: it.skip_layer ?? 22, seed: it.seed, model: it.model || st.model, aspect: "", image: it.image_id || "",
         loras: (it.loras || []).filter((l) => loras.some((x) => x.id === l.path)).map((l) => ({ id: l.path, strength: l.strength })) });
       saveGenState(st);
       for (const [k, sel] of Object.entries(fields)) if (k !== "mp") $(sel).value = st[k];
-      syncAspect(); renderLoras();
+      syncAspect(); renderLoras(); renderSource(); renderModelBadge(); prevModel = st.model;
       window.scrollTo({ top: 0, behavior: "smooth" });
       toast("Settings loaded (same seed)", "ok");
     }
@@ -1016,6 +1170,99 @@ async function pageGenerate(params) {
   });
 
   every(refreshStatus, 1500);
+}
+
+// ------------------------------------------------------------------ settings
+async function pageSettings() {
+  let s = await api("/api/settings");
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Settings</h1><div class="sub">API keys and model downloads. Keys are stored on this machine (<span class="mono">workspace/settings.json</span>) and never shown in full again.</div></div></div>
+    <div class="settings">
+      <div class="card"><div class="card-head"><h2>Hugging Face</h2><span id="hf-state"></span></div><div class="card-body">
+        <div class="field">Access token
+          <div class="secret-row"><input type="password" id="hf-token" autocomplete="off" placeholder="hf_…">
+            <button class="btn btn-primary" id="hf-save">Save</button><button class="btn btn-ghost" id="hf-clear">Remove</button></div>
+          <span class="help">Needed for gated models. Fibo 2.0 is gated: open <a href="https://huggingface.co/briaai/Fibo-2.0-dev" target="_blank" rel="noopener">Fibo 2.0 Dev</a> and <a href="https://huggingface.co/briaai/Fibo-2.0-edit-turbo" target="_blank" rel="noopener">Fibo 2.0 Edit Turbo</a>, accept the license with your account, then create a <b>Read</b> token at <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a> and paste it here.</span></div>
+        <div class="row"><button class="btn" id="hf-check">Check access</button><div id="hf-result" class="access-list"></div></div>
+      </div></div>
+      <div class="card"><div class="card-head"><h2>Models</h2><span class="faint" style="font-size:12px">Models also download on first use</span></div><div id="models"></div></div>
+      <div class="card"><div class="card-head"><h2>AI captioning (OpenRouter)</h2><span id="or-state"></span></div><div class="card-body">
+        <div class="field">OpenRouter API key
+          <div class="secret-row"><input type="password" id="or-key" autocomplete="off" placeholder="sk-or-…">
+            <button class="btn btn-primary" id="or-save">Save</button><button class="btn btn-ghost" id="or-clear">Remove</button></div>
+          <span class="help">Used by “Caption with AI” in the dataset viewer to write Fibo 2.0 VGL captions. Get a key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a>.</span></div>
+        <label class="field">Vision model
+          <div class="secret-row"><input type="text" id="or-model" list="or-models"><button class="btn" id="or-model-save">Save</button><span></span></div>
+          <datalist id="or-models">${["google/gemini-3.5-flash-lite", "google/gemini-3.5-flash", "google/gemini-2.5-flash", "qwen/qwen3-vl-235b-a22b-instruct", "anthropic/claude-haiku-5.5", "openai/gpt-5-mini"].map((m) => `<option value="${m}">`).join("")}</datalist>
+          <span class="help">Any OpenRouter model that takes images. The default, <span class="mono">${esc(s.caption_model_default)}</span>, is what Bria's own VGL tool uses.</span></label>
+        <div class="row"><button class="btn" id="or-check">Check key</button><div id="or-result" class="muted" style="font-size:12.5px"></div></div>
+      </div></div>
+    </div>`;
+
+  const keyBadge = (has, hint) => `<span class="badge ${has ? "done" : ""}">${has ? `Saved · ${esc(hint)}` : "Not set"}</span>`;
+  function render() {
+    $("#hf-state").innerHTML = s.has_hf_token ? keyBadge(true, s.hf_token) : s.env_hf_token ? `<span class="badge done">From environment (HF_TOKEN)</span>` : keyBadge(false);
+    $("#or-state").innerHTML = keyBadge(s.has_openrouter_key, s.openrouter_key);
+    $("#or-model").value = s.caption_model;
+  }
+  render();
+  const save = async (body, msg) => { s = await guard(() => api("/api/settings", { method: "PUT", body }), msg); render(); };
+  $("#hf-save").onclick = async () => {
+    const v = $("#hf-token").value.trim();
+    if (!v) return toast("Paste a token first", "error");
+    await save({ hf_token: v }, "Hugging Face token saved");
+    $("#hf-token").value = "";
+    $("#hf-check").click();
+  };
+  $("#hf-clear").onclick = () => save({ hf_token: "" }, "Token removed");
+  $("#or-save").onclick = async () => {
+    const v = $("#or-key").value.trim();
+    if (!v) return toast("Paste a key first", "error");
+    await save({ openrouter_key: v }, "OpenRouter key saved");
+    $("#or-key").value = "";
+  };
+  $("#or-clear").onclick = () => save({ openrouter_key: "" }, "Key removed");
+  $("#or-model-save").onclick = () => save({ caption_model: $("#or-model").value.trim() }, "Caption model saved");
+  $("#hf-check").onclick = async () => {
+    $("#hf-result").innerHTML = '<span class="faint">Checking…</span>';
+    const r = await api("/api/settings/check-hf", { method: "POST" });
+    const label = { ok: ["ok", "access granted"], gated: ["bad", "license not accepted yet: open the model page and accept it"], no_access: ["bad", "no access (check the token)"] };
+    $("#hf-result").innerHTML = (r.user ? `<div class="ok">Signed in as <b>${esc(r.user)}</b></div>` : `<div class="bad">${esc(r.error || "No token")}</div>`) +
+      Object.entries(r.access).map(([repo, a]) => {
+        const [cls, text] = !r.user && a !== "ok" ? ["bad", "needs a token"] : label[a] || ["bad", a];
+        return `<div class="${cls}"><a href="https://huggingface.co/${esc(repo)}" target="_blank" rel="noopener">${esc(repo)}</a>: ${esc(text)}</div>`;
+      }).join("");
+  };
+  $("#or-check").onclick = async () => {
+    $("#or-result").textContent = "Checking…";
+    try {
+      const k = await api("/api/settings/check-openrouter", { method: "POST" });
+      $("#or-result").innerHTML = `<span style="color:var(--green)">Key works</span>${k.label ? ` · ${esc(k.label)}` : ""}${k.usage != null ? ` · used $${Number(k.usage).toFixed(2)}` : ""}${k.limit != null ? ` of $${Number(k.limit).toFixed(2)}` : ""}`;
+    } catch (e) { $("#or-result").innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`; }
+  };
+
+  const DL = { none: "", downloading: "running", done: "done", error: "error" };
+  const DL_LABEL = { none: "Not downloaded", downloading: "Downloading", done: "Downloaded", error: "Failed" };
+  let modelsKey = "";
+  every(async () => {
+    const models = await api("/api/models");
+    const key = JSON.stringify(models);
+    if (key === modelsKey) return;
+    modelsKey = key;
+    $("#models").innerHTML = `<table><thead><tr><th>Model</th><th>Use</th><th>Status</th><th></th></tr></thead><tbody>
+      ${models.map((m) => `<tr><td><b>${esc(m.label)}</b><div class="faint mono" style="font-size:11.5px">${m.repo ? `<a href="https://huggingface.co/${esc(m.repo)}" target="_blank" rel="noopener">${esc(m.repo)}</a>` : esc(m.id)}${m.gated ? " · gated" : ""}</div></td>
+        <td class="muted">${m.trainable ? "Training + generation" : "Generation"}</td>
+        <td><span class="badge ${DL[m.download.state]}">${DL_LABEL[m.download.state]}</span>${m.download.message ? `<div class="faint mono dl-msg" title="${esc(m.download.message)}">${esc(m.download.message)}</div>` : ""}</td>
+        <td style="text-align:right">${m.download.state === "downloading" ? "" : `<button class="btn btn-sm" data-dl="${esc(m.id)}">${I.download} ${m.download.state === "done" ? "Verify" : "Download"}</button>`}</td></tr>`).join("")}
+      </tbody></table>`;
+  }, 2000);
+  $("#models").onclick = async (e) => {
+    const b = e.target.closest("[data-dl]");
+    if (!b) return;
+    b.disabled = true;
+    await guard(() => api("/api/models/download", { method: "POST", body: { model: b.dataset.dl } }), "Download started");
+    modelsKey = "";
+  };
 }
 
 // ------------------------------------------------------------------ boot

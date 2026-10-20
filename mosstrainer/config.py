@@ -17,6 +17,40 @@ _KREA_VAE = "Qwen/Qwen-Image"            # byte-identical to the Krea 2 VAE
 _MOSS_DEFAULTS = {"steps": 30, "cfg": 3.0, "shift": 5.0, "skip_layer": 22, "timestep_sampling": "moss"}
 _KREA_DEFAULTS = {"steps": 28, "cfg": 5.5, "shift": 0.0, "skip_layer": -1, "timestep_sampling": "flux_shift"}
 _KREA_TURBO_DEFAULTS = {"steps": 8, "cfg": 1.0, "shift": 1.15, "skip_layer": -1, "timestep_sampling": "flux_shift"}
+# Fibo 2.0 reads structured VGL captions (JSON). The negative is the one Bria's model card uses for text-to-image.
+FIBO_NEGATIVE_T2I = (
+    '{"short_description":"","objects":[{"description":"the main subject","texture":"smooth, featureless, '
+    'plastic-like, airbrushed, no fine surface detail","appearance_details":"soft blurred edges, simplified shapes, '
+    'no fine detail","skin_tone_and_texture":"waxy airbrushed skin, poreless, plastic smooth"}],"background_setting":'
+    '"a plain seamless studio backdrop, perfectly smooth gradient, blurred and featureless, no visible texture",'
+    '"lighting":{},"aesthetics":{"artifacts":["oversaturated colours","neon colour cast","overexposed highlights",'
+    '"lens flare","slight blur","motion blur","haze"]},"photographic_characteristics":{"depth_of_field":"shallow, '
+    'heavy bokeh obscuring most of the frame","focus":"soft, slightly out of focus, lacking fine texture"},'
+    '"style_medium":"","context":"","artistic_style":""}')
+_FIBO_DEFAULTS = {"steps": 50, "cfg": 5.0, "shift": 0.0, "skip_layer": -1, "timestep_sampling": "fibo",
+                  "negative": FIBO_NEGATIVE_T2I}
+_FIBO_TURBO_DEFAULTS = {"steps": 4, "cfg": 1.0, "shift": 0.0, "skip_layer": -1, "timestep_sampling": "fibo"}
+# The recipe of Bria's fine_tuning/train_lora.py: LoRA on every Linear layer, AdamW with weight decay 0.01,
+# 10% caption dropout to the null caption.
+_FIBO_OVERRIDES = {
+    "network": {"targets": ["attn", "ffn", "text", "other"]},
+    "data": {"caption_dropout": 0.1},
+    "train": {"weight_decay": 0.01},
+    "sample": {"prompts": [
+        '{"short_description":"[trigger], a portrait photo in soft natural window light","style_medium":"photograph"}',
+        '{"short_description":"[trigger] standing on a city street at night under neon signs",'
+        '"text_render":[{"text":"FIBO","location":"top center","size":"large","color":"pink neon",'
+        '"font":"neon sign lettering"}],"style_medium":"photograph"}',
+    ]},
+}
+
+# LoRA target groups per family: key -> label (the regexes live in backends.py).
+FAMILY_TARGETS = {
+    "moss": {"attn": "Attention (q, k, v, o)", "ffn": "Feed-forward", "text": "Text refiner blocks"},
+    "krea2": {"attn": "Attention (q, k, v, gate, o)", "ffn": "Feed-forward", "text": "Text fusion blocks"},
+    "fibo2": {"attn": "Attention (self + text cross-attention)", "ffn": "Feed-forward", "text": "Text perceiver",
+              "other": "Modulation & embedders"},
+}
 
 MODEL_SPECS = {
     "OpenMOSS-Team/MOSS-Image-Base": {
@@ -44,6 +78,13 @@ MODEL_SPECS = {
         "label": "Krea 2 Turbo (generation only)", "family": "krea2", "trainable": False,
         "repo": "Comfy-Org/Krea-2", "file": "diffusion_models/krea2_turbo_bf16.safetensors",
         "text_encoder": _KREA_TE, "vae": _KREA_VAE, "defaults": _KREA_TURBO_DEFAULTS},
+    # Gated on Hugging Face: accept the license and add a token in Settings.
+    "briaai/Fibo-2.0-dev": {
+        "label": "Fibo 2.0 Dev (Bria, recommended for LoRA)", "family": "fibo2", "trainable": True, "gated": True,
+        "edit": True, "defaults": _FIBO_DEFAULTS, "overrides": _FIBO_OVERRIDES},
+    "briaai/Fibo-2.0-edit-turbo": {
+        "label": "Fibo 2.0 Edit Turbo (4 steps, generation only)", "family": "fibo2", "trainable": False,
+        "gated": True, "edit": True, "defaults": _FIBO_TURBO_DEFAULTS},
 }
 
 # Extra models (local paths etc.) can be registered from a JSON file, e.g. for tests.
@@ -119,14 +160,15 @@ DEFAULTS = {
 
 
 def defaults_for(model_id: str) -> dict:
-    """DEFAULTS with the model's recommended sampling / timestep settings filled in."""
-    d = MODEL_SPECS.get(model_id, {}).get("defaults", {})
-    return merge(DEFAULTS, {
+    """DEFAULTS with the model's recommended sampling / timestep settings (and training overrides) filled in."""
+    spec = MODEL_SPECS.get(model_id, {})
+    d = spec.get("defaults", {})
+    return merge(merge(DEFAULTS, {
         "model": model_id,
         "train": {"timestep_sampling": d.get("timestep_sampling", "moss")},
         "sample": {"steps": d.get("steps", 30), "cfg": d.get("cfg", 3.0), "shift": d.get("shift", 5.0),
-                   "uncond_skip_layer": d.get("skip_layer", 22)},
-    })
+                   "uncond_skip_layer": d.get("skip_layer", 22), "negative_prompt": d.get("negative", "")},
+    }), spec.get("overrides", {}))
 
 
 def merge(base: dict, override: dict) -> dict:
@@ -181,6 +223,10 @@ def validate(cfg: dict) -> dict:
         raise ValueError("Rank must be between 1 and 512.")
     if not n["targets"]:
         raise ValueError("Select at least one LoRA target.")
+    allowed = FAMILY_TARGETS.get(spec["family"], {})
+    n["targets"] = [x for x in n["targets"] if x in allowed]
+    if not n["targets"]:
+        raise ValueError(f"Select at least one LoRA target ({', '.join(allowed)}).")
     parse_layers(n["layers"])
     t = cfg["train"]
     for key in ("steps", "batch_size", "grad_accum", "warmup_steps", "seed"):

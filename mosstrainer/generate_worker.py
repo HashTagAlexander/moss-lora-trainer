@@ -5,7 +5,8 @@ Library output is redirected to stderr so it can't corrupt the event stream.
 
 Requests:
   {"cmd": "generate", "id", "model", "prompt", "negative", "width", "height", "steps", "cfg",
-   "shift", "seed", "count", "skip_layer", "loras": [{"path", "strength", "name"}], "low_vram", "out_dir"}
+   "shift", "seed", "count", "skip_layer", "loras": [{"path", "strength", "name"}], "low_vram", "out_dir",
+   "image" (optional source image path to edit; Fibo 2.0), "image_id"}
   {"cmd": "offload"}   move the text encoder to CPU (e.g. because training started)
 SIGUSR1 cancels the generation in progress. The worker exits after `--idle` seconds without requests.
 """
@@ -99,21 +100,22 @@ class Worker:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def encode(self, prompt: str, low_vram: bool) -> torch.Tensor:
-        if prompt in self.embeds:
-            self.embeds.move_to_end(prompt)
-            return self.embeds[prompt]
+    def encode(self, prompt: str, low_vram: bool, images=None, key=None) -> torch.Tensor:
+        key = key or prompt
+        if key in self.embeds:
+            self.embeds.move_to_end(key)
+            return self.embeds[key]
         moved = False
         if self.device.type == "cuda" and self.te.device.type == "cpu":
             self.te.model.to(self.device)
             self.te.device = self.device
             moved = True
         try:
-            emb = self.te.encode(prompt)
+            emb = self.te.encode(prompt, images=images) if images else self.te.encode(prompt)
         finally:
             if moved and low_vram:
                 self.offload_te()
-        self.embeds[prompt] = emb
+        self.embeds[key] = emb
         if len(self.embeds) > 32:
             self.embeds.popitem(last=False)
         return emb
@@ -131,9 +133,25 @@ class Worker:
             if miss:
                 emit(event="warning", id=rid, message=f"{Path(path).name}: {miss} layers didn't match this model")
 
+        width, height = int(req["width"]) // 16 * 16, int(req["height"]) // 16 * 16
+        extra = {}
         emit(event="status", state="generating", message="Encoding prompt…")
-        pos = self.encode(req["prompt"], low_vram)
-        neg = self.encode(req.get("negative", ""), low_vram)
+        if req.get("image"):  # edit a source image (Fibo 2.0): it conditions the prompt and the transformer
+            if not self.backend.supports_edit:
+                raise ValueError("This model can't edit images; remove the source image or pick a Fibo 2.0 model.")
+            from PIL import Image, ImageOps
+            src = Path(req["image"])
+            with Image.open(src) as im:
+                image = ImageOps.exif_transpose(im).convert("RGB")
+            extra["context"], thumbs, width, height = self.backend.prepare_edit(self.vae, image, width, height)
+            key = f"{req['prompt']}\x00{src.resolve()}\x00{src.stat().st_mtime_ns}\x00{width}x{height}"
+            pos = self.encode(req["prompt"], low_vram, images=thumbs, key=key)
+        else:
+            pos = self.encode(req["prompt"], low_vram)
+            early = self.backend.prompt_parts(req["prompt"])[1]
+            if early:
+                extra["early"] = self.encode(early, low_vram)
+        neg = self.encode(self.backend.negative_prompt(req.get("negative") or ""), low_vram)
 
         out_dir = Path(req["out_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +160,6 @@ class Worker:
         if base_seed < 0:
             base_seed = random.randint(0, 2**31 - 1)
         skip = int(req.get("skip_layer", 22))
-        width, height = int(req["width"]) // 16 * 16, int(req["height"]) // 16 * 16
         steps = int(req.get("steps", 50))
 
         for i in range(count):
@@ -157,13 +174,14 @@ class Worker:
             img = self.backend.sample(self.transformer, self.vae, pos, neg, width=width, height=height,
                                       steps=steps, cfg=float(req.get("cfg", 3.0)), seed=seed,
                                       shift=float(req.get("shift", 0.0)), skip_layer=skip, device=self.device,
-                                      progress=progress)
+                                      progress=progress, **extra)
             stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{rid}_{i}"
             img.save(out_dir / f"{stem}.png")
             thumb = img.copy()
             thumb.thumbnail((512, 512))
             thumb.convert("RGB").save(out_dir / f"{stem}.thumb.jpg", quality=85)
-            meta = {k: req.get(k) for k in ("model", "prompt", "negative", "steps", "cfg", "shift", "skip_layer")}
+            meta = {k: req.get(k) for k in ("model", "prompt", "negative", "steps", "cfg", "shift", "skip_layer",
+                                            "image_id")}
             meta.update(width=width, height=height, seed=seed, created=time.time(), seconds=round(time.time() - t0, 1),
                         loras=[{"name": lr.get("name") or Path(lr["path"]).name, "path": lr.get("id", lr["path"]),
                                 "strength": lr.get("strength", 1.0)} for lr in req.get("loras", [])])
