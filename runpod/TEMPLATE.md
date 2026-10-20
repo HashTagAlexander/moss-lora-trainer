@@ -46,7 +46,7 @@ in the background, SSH comes up straight away while setup runs.
 |---|---|
 | `MOSS_TRAINER_PASSWORD` | the UI's `admin` password. Store it as a RunPod secret and enter `{{ RUNPOD_SECRET_moss_password }}` as the value |
 | `HF_TOKEN` | Hugging Face token, needed to pre-download gated models (Fibo 2.0). Also a good secret. You can enter it later under **Settings** in the UI instead |
-| `MODELS` | models to download during setup, e.g. `briaai/Fibo-2.0-dev` or `OpenMOSS-Team/MOSS-Image-Base kroma-v0.3-teacher`. Set it to an empty value to skip; models also download on first use |
+| `MODELS` | models to download during setup, e.g. `briaai/Fibo-2.0-dev` or `OpenMOSS-Team/MOSS-Image-Base kroma-v0.3-teacher`. Set it to `none` to skip; models also download on first use |
 | `MOSS_TRAINER_UPDATE` | `0` keeps the current code instead of pulling the latest on every start |
 | `MOSS_TRAINER_REPO`, `MOSS_TRAINER_BRANCH` | use a fork or another branch |
 
