@@ -1,8 +1,9 @@
-"""Structured VGL captions for Fibo 2.0, written by a vision-language model through OpenRouter.
+"""Dataset captions written by a vision-language model through OpenRouter, in one of two styles.
 
-Fibo 2.0 is trained on captions in Bria's VGL (Visual GenAI Language): one JSON object per image. The prompt follows
-the one Bria's own captioner uses (github.com/Bria-AI/vgl, `Caption` in the Thales dialect), reworded to describe a
-real image, and the result is put in the same key order Bria serialises VGL in.
+"vgl": structured captions for Fibo 2.0, which is trained on Bria's VGL (Visual GenAI Language): one JSON object per
+image. The prompt follows the one Bria's own captioner uses (github.com/Bria-AI/vgl, `Caption` in the Thales
+dialect), reworded to describe a real image, and the result is put in the same key order Bria serialises VGL in.
+"natural": a few plain, flowing sentences, for MOSS-Image, Krea 2 and other models trained on natural language.
 """
 from __future__ import annotations
 
@@ -64,6 +65,33 @@ written. Use [] when the image has no text. Each entry is an object with "text",
 10. "artistic_style": the style in 3 words at most, e.g. "impressionistic, vibrant, textured"."""
 
 USER_PROMPT = "Analyze the provided image and write its VGL caption as specified in your instructions."
+
+NATURAL_PROMPT = """\
+You write captions for training an image generation model. Describe the image in simple, natural English: two to \
+four flowing sentences, 40 to 90 words, that read like a person describing the picture to a friend.
+
+How to write it
+- Start with the main subject, then describe, in this order: their hair, clothing and accessories (with colors), \
+any tattoos or other distinctive features, what they are holding or doing, their pose and expression, then the \
+setting, the time of day and the lighting.
+- Describe only what is actually visible. Don't guess names, ages, identities or what isn't in the picture.
+- Use plain, concrete words: "a fitted white mini skirt", not "a stunning outfit". No flowery or poetic language.
+- Describe a person's left and right from the person's own point of view, not the viewer's.
+- If it isn't a photograph, say what it is near the start (e.g. "a 2D cartoon illustration of…", "a 3D render of…").
+- Write out any clearly readable text in quotes.
+- Name a brand only if its name or logo is clearly readable.
+- Don't start with "The image shows" or "This is a photo of", and don't use lists, line breaks or headings.
+
+Example of the style (for a different picture):
+A man with short curly brown hair and a trimmed beard sits at a small café table, wearing a navy denim jacket over \
+a white T-shirt. He holds a white coffee cup in his right hand and looks out the window with a relaxed smile. \
+Warm afternoon sunlight falls across the wooden table, and a blurred street with parked bicycles is visible \
+behind the glass.
+
+Reply with the caption only."""
+
+NATURAL_USER_PROMPT = "Write the caption for this image."
+STYLES = ("vgl", "natural")
 
 # Bria's VGL key order (bria_vgl.model.VGL), used to serialise captions the way Fibo 2.0 saw them.
 _ORDER = ["short_description", "objects", "background_setting", "lighting", "aesthetics",
@@ -184,26 +212,42 @@ def _post(api_key: str, body: dict, timeout: float = 180) -> dict:
         raise CaptionError(f"OpenRouter unreachable: {e}") from None
 
 
-def caption_image(path: Path, api_key: str, model: str = DEFAULT_MODEL, extra: str = "", attempts: int = 4) -> dict:
-    """Caption one image. `extra` is appended to the instructions (e.g. "The woman is called Mira.")."""
+def parse_natural(text: str) -> str:
+    """A plain caption: one paragraph, without quotes, fences or a leading "Caption:"."""
+    text = re.sub(r"```\w*", "", text or "").strip()
+    text = re.sub(r"^(caption|description)\s*:\s*", "", text, flags=re.I)
+    text = " ".join(text.split()).strip().strip('"“”').strip()
+    if len(text) < 10:
+        raise CaptionError("the model's caption is empty")
+    return text
+
+
+def caption_image(path: Path, api_key: str, model: str = DEFAULT_MODEL, extra: str = "", attempts: int = 4,
+                  style: str = "vgl") -> dict | str:
+    """Caption one image: a VGL dict, or a string for style "natural". `extra` is appended to the instructions
+    (e.g. "The woman is called Mira.")."""
     if not api_key:
         raise CaptionError("Add your OpenRouter API key in Settings first.")
-    system = SYSTEM_PROMPT + (f"\n\nAdditional instructions from the user:\n{extra.strip()}" if extra.strip() else "")
+    natural = style == "natural"
+    system = (NATURAL_PROMPT if natural else SYSTEM_PROMPT) + (
+        f"\n\nAdditional instructions from the user:\n{extra.strip()}" if extra.strip() else "")
     messages = [{"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": USER_PROMPT},
+                {"role": "user", "content": [{"type": "text", "text": NATURAL_USER_PROMPT if natural else USER_PROMPT},
                                              {"type": "image_url", "image_url": {"url": image_data_url(path)}}]}]
-    formats = [{"type": "json_schema", "json_schema": {"name": "vgl_caption", "schema": _schema()}},
-               {"type": "json_object"}, None]
+    formats = [None] if natural else [
+        {"type": "json_schema", "json_schema": {"name": "vgl_caption", "schema": _schema()}}, {"type": "json_object"}, None]
     last = None
     for attempt in range(attempts):
-        body = {"model": model or DEFAULT_MODEL, "messages": messages, "temperature": 0.2, "max_tokens": 8000}
+        body = {"model": model or DEFAULT_MODEL, "messages": messages, "temperature": 0.2,
+                "max_tokens": 1000 if natural else 8000}
         if formats[0]:
             body["response_format"] = formats[0]
         try:
             reply = _post(api_key, body)
             if reply.get("error"):
                 raise CaptionError(f"OpenRouter: {reply['error'].get('message', reply['error'])}")
-            return parse_reply(reply["choices"][0]["message"].get("content") or "")
+            content = reply["choices"][0]["message"].get("content") or ""
+            return parse_natural(content) if natural else parse_reply(content)
         except CaptionError as e:
             last = e
             msg = str(e)
@@ -230,6 +274,6 @@ def check_key(api_key: str) -> dict:
         raise CaptionError(f"OpenRouter unreachable: {e}") from None
 
 
-def caption_text(caption: dict) -> str:
-    """How a VGL caption is stored in the dataset's .txt file (readable JSON; training re-serialises it)."""
-    return json.dumps(caption, ensure_ascii=False, indent=2)
+def caption_text(caption: dict | str) -> str:
+    """How a caption is stored in the dataset's .txt file (VGL as readable JSON; training re-serialises it)."""
+    return caption if isinstance(caption, str) else json.dumps(caption, ensure_ascii=False, indent=2)

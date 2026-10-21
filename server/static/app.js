@@ -729,7 +729,7 @@ async function pageDataset(name) {
     <div class="page-head"><div><h1>${esc(name)}</h1><div class="sub" id="ds-sub"></div></div>
       <div class="row">
         <select id="bulk" style="width:auto"><option value="">Bulk caption…</option><option value="prepend">Prepend text</option><option value="append">Append text</option><option value="replace">Find & replace</option><option value="fill_empty">Fill empty captions</option></select>
-        <button class="btn" id="vlm" title="Write Fibo 2.0 VGL captions with a vision model (OpenRouter)">${I.spark} Caption with AI</button>
+        <button class="btn" id="vlm" title="Write captions with a vision model (OpenRouter): natural language or Fibo 2.0 VGL">${I.spark} Caption with AI</button>
         <a class="btn btn-primary" href="#/new?dataset=${enc(name)}">${I.flask} Train on this</a>
         <button class="btn btn-ghost btn-danger" id="del-ds">${I.trash}</button></div></div>
     <div class="dropzone" id="drop">${I.upload}<div><b>Drop images, .txt/.json captions or a .zip here</b></div><div class="faint" style="font-size:12px">or click to browse · captions pair with images by filename</div>
@@ -747,7 +747,7 @@ async function pageDataset(name) {
     $("#items").innerHTML = items.length ? items.map((it, i) => `
       <div class="item ${it.caption.trim() ? "" : "nocap"}" data-file="${esc(it.file)}">
         <div class="img-wrap"><img loading="lazy" src="${base}/image/${enc(it.file)}?thumb=1&v=${it.mtime}" data-i="${i}">
-          <button class="btn btn-sm vlm" data-vlm="${esc(it.file)}" title="Caption this image with AI (VGL)">${I.spark}</button>
+          <button class="btn btn-sm vlm" data-vlm="${esc(it.file)}" title="Caption this image with AI">${I.spark}</button>
           <button class="btn btn-sm del" data-del="${esc(it.file)}">${I.trash}</button></div>
         <textarea placeholder="Write a caption…" class="${isJson(it.caption) ? "json" : ""}">${esc(it.caption)}</textarea>
         <div class="meta"><span title="${esc(it.file)}">${esc(it.file.length > 28 ? it.file.slice(0, 25) + "…" : it.file)}</span><span class="state">${fmtBytes(it.size)}</span></div></div>`).join("")
@@ -802,7 +802,7 @@ async function pageDataset(name) {
     const one = e.target.closest("[data-vlm]");
     if (one) {
       if (!(await needOpenRouterKey())) return;
-      await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: "files", files: [one.dataset.vlm] } }));
+      await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: "files", files: [one.dataset.vlm], style: capStyle() } }));
       one.closest(".item").classList.add("captioning");
       return pollCaptions();
     }
@@ -844,19 +844,29 @@ async function pageDataset(name) {
       .then((v) => { if (v) location.hash = "#/settings"; });
     return null;
   }
+  // The caption style last used on this dataset; at first, whatever its existing captions are.
+  const STYLE_KEY = `moss.capstyle.${name}`;
+  const capStyle = () => {
+    try { const v = localStorage.getItem(STYLE_KEY); if (v) return v; } catch { /* private mode */ }
+    return items.some((i) => isJson(i.caption)) ? "vgl" : "natural";
+  };
   $("#vlm").onclick = async () => {
     const s = await needOpenRouterKey();
     if (!s) return;
-    const missing = items.filter((i) => !i.caption.trim()).length;
+    const missing = items.filter((i) => !i.caption.trim()).length, style = capStyle();
     const v = await modal({ title: "Caption with AI", confirm: "Start captioning", body: `
-      <p class="muted" style="margin:0 0 12px">Writes a structured <a href="https://docs.bria.ai/vgl" target="_blank" rel="noopener">VGL</a> caption (JSON) for each image, the format Fibo 2.0 is trained on, using <span class="mono">${esc(s.caption_model)}</span>. Your trigger word is added to the short description at training time.</p>
-      <label class="field">Images<select name="scope">
+      <p class="muted" style="margin:0 0 12px">Sends each image to <span class="mono">${esc(s.caption_model)}</span> on OpenRouter and saves its caption. Your trigger word is added at training time.</p>
+      <label class="field">Caption style<select name="style">
+        <option value="natural" ${style === "natural" ? "selected" : ""}>Natural language: a few plain sentences (MOSS-Image, Krea 2)</option>
+        <option value="vgl" ${style === "vgl" ? "selected" : ""}>VGL: structured JSON, the format Fibo 2.0 is trained on</option></select></label>
+      <label class="field" style="margin-top:12px">Images<select name="scope">
         <option value="missing">Images without a caption (${missing})</option>
         <option value="all">All images (${items.length}), replacing existing captions</option></select></label>
       <label class="field" style="margin-top:12px">Extra instructions <span class="help">Optional, e.g. “The woman in every photo is called Mira.”</span>
         <textarea name="extra" rows="3"></textarea></label>` });
     if (!v) return;
-    await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: v.scope, extra: v.extra } }), "Captioning started");
+    try { localStorage.setItem(STYLE_KEY, v.style); } catch { /* private mode */ }
+    await guard(() => api(`${base}/autocaption`, { method: "POST", body: { scope: v.scope, extra: v.extra, style: v.style } }), "Captioning started");
     pollCaptions();
   };
 
@@ -888,7 +898,7 @@ async function pageDataset(name) {
     const pctDone = st.total ? (100 * (st.done + st.failed)) / st.total : 0;
     el.innerHTML = `<div class="card cap-run"><div class="card-body">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <div>${running ? `Captioning with <span class="mono">${esc(st.model)}</span>…` : st.state === "cancelled" ? "Captioning stopped" : "Captioning finished"}
+        <div>${running ? `Captioning (${st.style === "natural" ? "natural language" : "VGL"}) with <span class="mono">${esc(st.model)}</span>…` : st.state === "cancelled" ? "Captioning stopped" : "Captioning finished"}
           <span class="muted">${st.done}/${st.total} done${st.failed ? `, ${st.failed} failed` : ""}</span></div>
         ${running ? `<button class="btn btn-sm" id="cap-cancel">${I.stop} Stop</button>` : `<button class="btn btn-sm btn-ghost" id="cap-close">${I.x}</button>`}</div>
       <div class="progress big"><div style="width:${pctDone.toFixed(1)}%"></div></div>

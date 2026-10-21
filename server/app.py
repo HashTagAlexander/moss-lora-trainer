@@ -424,7 +424,7 @@ downloads = DownloadManager()
 # --------------------------------------------------------------------------- VLM captioning (OpenRouter)
 
 class CaptionManager:
-    """Writes VGL captions for a dataset's images in the background, a few requests at a time."""
+    """Writes captions (VGL or natural language) for a dataset's images in the background, a few at a time."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -435,7 +435,7 @@ class CaptionManager:
             st = self.runs.get(dataset)
             return {k: v for k, v in st.items() if k != "cancel"} if st else {"state": "idle"}
 
-    def start(self, dataset: str, files: list[str], extra: str):
+    def start(self, dataset: str, files: list[str], extra: str, style: str = "vgl"):
         s = load_settings()
         if not s.get("openrouter_key"):
             raise HTTPException(400, "Add your OpenRouter API key in Settings first.")
@@ -443,6 +443,7 @@ class CaptionManager:
             if self.runs.get(dataset, {}).get("state") == "running":
                 raise HTTPException(409, "Captioning is already running for this dataset")
             st = {"state": "running", "total": len(files), "done": 0, "failed": 0, "errors": [], "cancel": False,
+                  "style": style,
                   "model": s.get("caption_model") or captioner.DEFAULT_MODEL, "finished": [], "started": time.time()}
             self.runs[dataset] = st
         threading.Thread(target=self._run, args=(dataset, files, extra, s, st), daemon=True).start()
@@ -460,7 +461,7 @@ class CaptionManager:
             if st["cancel"]:
                 return
             try:
-                cap = captioner.caption_image(folder / name, s["openrouter_key"], st["model"], extra)
+                cap = captioner.caption_image(folder / name, s["openrouter_key"], st["model"], extra, style=st["style"])
                 (folder / name).with_suffix(".txt").write_text(captioner.caption_text(cap), encoding="utf-8")
                 with self.lock:
                     st["done"] += 1
@@ -751,7 +752,7 @@ async def bulk_caption(name: str, request: Request):
 
 @app.post("/api/datasets/{name}/autocaption")
 async def autocaption(name: str, request: Request):
-    """Caption images with a VLM in Bria's VGL format. scope: missing | all | files (with "files")."""
+    """Caption images with a VLM. scope: missing | all | files (with "files"); style: vgl (Fibo 2.0) | natural."""
     folder = DATASETS / safe_name(name)
     if not folder.is_dir():
         raise HTTPException(404)
@@ -768,7 +769,10 @@ async def autocaption(name: str, request: Request):
                  if not (p.with_suffix(".txt").exists() and p.with_suffix(".txt").read_text(encoding="utf-8").strip())]
     if not files:
         raise HTTPException(400, "No images to caption")
-    captions.start(name, files, str(body.get("extra", ""))[:2000])
+    style = body.get("style", "vgl")
+    if style not in captioner.STYLES:
+        raise HTTPException(400, f"Unknown caption style: {style}")
+    captions.start(name, files, str(body.get("extra", ""))[:2000], style)
     return captions.status(name)
 
 

@@ -5,7 +5,8 @@ A self-hosted web UI (in the spirit of ai-toolkit) for training LoRAs on
 with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
 
 - **Datasets**: drag-and-drop images / `.txt` or `.json` captions / `.zip`, inline caption editor, bulk prepend/append/replace,
-  and **Caption with AI**: structured VGL captions for Fibo 2.0 written by a vision model through OpenRouter.
+  and **Caption with AI**: a vision model on OpenRouter writes either natural-language captions (a few plain
+  sentences, for MOSS-Image and Krea 2) or structured VGL captions for Fibo 2.0.
 - **Jobs**: form or raw-JSON config, GPU queue, live loss chart, sample grid per step, log viewer,
   stop (saves a checkpoint first), resume, "train more", clone, reset.
 - **Output**: `.safetensors` LoRAs with ComfyUI-style keys (`diffusion_model.layers.N.proj.q.lora_A.weight`, …).
