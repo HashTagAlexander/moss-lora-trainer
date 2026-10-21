@@ -75,8 +75,23 @@ class Job:
 # --------------------------------------------------------------------------- timesteps
 
 def sample_sigmas(n: int, t: dict, device, tokens: int = 4096) -> torch.Tensor:
+    """Noise levels for a batch: drawn from the timestep type, then skewed by the timestep bias the way ai-toolkit
+    does it (draw 1000, sort from high to low noise, pick the index u^3 for high noise or 1 - u^3 for low noise)."""
+    bias = t.get("timestep_bias", "balanced")
+    if bias == "balanced":
+        return _draw_sigmas(n, t, tokens).clamp(0.001, 1.0).to(device)
+    schedule = _draw_sigmas(1000, t, tokens).sort(descending=True).values
+    u3 = torch.rand(n) ** 3
+    idx = (u3 if bias == "high_noise" else 1 - u3).mul(1000).long().clamp(0, 999)
+    return schedule[idx].clamp(0.001, 1.0).to(device)
+
+
+def _draw_sigmas(n: int, t: dict, tokens: int) -> torch.Tensor:
     mode = t["timestep_sampling"]
-    if mode == "fibo":
+    if mode == "sigmoid":
+        # ai-toolkit's "sigmoid": logit-normal around the middle noise levels (sigmoid of a standard normal).
+        sig = torch.sigmoid(torch.randn(n))
+    elif mode == "fibo":
         # Bria's Fibo 2.0 trainer: sigmoid(N(mu, 1)) with the resolution shift mu, mixed with 10% uniform.
         from .backends import Fibo2Backend
         mu = Fibo2Backend.calculate_mu(tokens)
@@ -90,17 +105,13 @@ def sample_sigmas(n: int, t: dict, device, tokens: int = 4096) -> torch.Tensor:
         # MOSS-Image final pretraining stage (tech report, Table 6): S = 1 - sigmoid(Z),
         # Z ~ N(-1.09, 0.95), truncated at 0.95 then rescaled onto [0, 1], mixed with 1% uniform.
         mu, s, cut, rho = -1.09, 0.95, 0.95, 0.01
-        out = torch.empty(n)
-        for i in range(n):
-            if random.random() < rho:
-                out[i] = random.random()
-                continue
-            while True:
-                v = 1 - torch.sigmoid(torch.randn(()) * s + mu).item()
-                if v <= cut:
-                    out[i] = v / cut
-                    break
-        sig = out
+        kept = torch.empty(0)
+        while kept.numel() < n:  # rejection sampling of the truncation, vectorised
+            v = 1 - torch.sigmoid(torch.randn(2 * n + 8) * s + mu)
+            kept = torch.cat([kept, v[v <= cut] / cut])
+        sig = kept[:n]
+        uniform = torch.rand(n) < rho
+        sig[uniform] = torch.rand(int(uniform.sum()))
     elif mode == "logit_normal":
         sig = torch.sigmoid(torch.randn(n) * t["logit_std"] + t["logit_mean"])
     elif mode == "shift":
@@ -108,7 +119,7 @@ def sample_sigmas(n: int, t: dict, device, tokens: int = 4096) -> torch.Tensor:
         sig = sh * u / (1 + (sh - 1) * u)
     else:
         sig = torch.rand(n)
-    return sig.clamp(0.001, 1.0).to(device)
+    return sig
 
 
 # --------------------------------------------------------------------------- optimizer
@@ -121,6 +132,11 @@ def make_optimizer(params, t):
     if name == "prodigy":
         from prodigyopt import Prodigy
         return Prodigy(params, lr=lr, weight_decay=wd, safeguard_warmup=True, use_bias_correction=True)
+    if name == "automagic3":
+        # Adapts one learning rate for the whole LoRA from how consistently the updates point the same way; the
+        # configured lr is only its starting point. Not fused, so gradient accumulation and clipping still work.
+        from .automagic3 import Automagic3
+        return Automagic3(params, lr=lr, weight_decay=wd, fused=False)
     if name == "adafactor":
         from transformers.optimization import Adafactor
         return Adafactor(params, lr=lr, weight_decay=wd, relative_step=False, scale_parameter=False,
@@ -131,6 +147,8 @@ def make_optimizer(params, t):
 
 def make_scheduler(opt, t):
     total, warm, kind = t["steps"], t["warmup_steps"], t["lr_scheduler"]
+    if t["optimizer"] == "automagic3":  # sets its own learning rate
+        warm, kind = 0, "constant"
 
     def factor(step):
         if warm and step < warm:
@@ -268,6 +286,8 @@ def run(job: Job):
         p.requires_grad_(True)
     opt = make_optimizer(params, t)
     lr_sched = make_scheduler(opt, t)
+    if t["optimizer"] == "automagic3" and (t["lr_scheduler"] != "constant" or t["warmup_steps"]):
+        job.log("note: Automagic sets its own learning rate, so the LR schedule and warmup are ignored")
 
     step = 0
     state_path = job.ckpt_dir / "training_state.pt"
@@ -416,6 +436,8 @@ def run(job: Job):
         times.append(time.time() - t0)
         sec = sum(times) / len(times)
         lr = opt.param_groups[0]["lr"]
+        if hasattr(opt, "get_avg_learning_rate"):  # Automagic: the adapted rate
+            lr = opt.get_avg_learning_rate()
         if t["optimizer"] == "prodigy":
             lr = lr * opt.param_groups[0].get("d", 1.0)
         metrics.write(json.dumps({"step": step, "loss": loss_total, "lr": lr, "sec": round(times[-1], 3),

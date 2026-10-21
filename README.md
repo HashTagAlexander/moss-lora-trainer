@@ -142,6 +142,10 @@ After a stop/start, run `bash /workspace/loratrainer/setup.sh` again (quick: eve
 4. Download LoRAs from the **Checkpoints** tab.
 
 Starting points: rank 32 / alpha 32, AdamW at 1e-4, 1500–3000 steps for 20–50 images, 1024 resolution.
+**Automagic v3** (from [ai-toolkit](https://github.com/ostris/ai-toolkit), MIT) adapts its own learning rate: the
+value you set is only where it starts, and the LR schedule and warmup are ignored. **Timestep bias** (Balanced / High
+noise / Low noise) skews any timestep type toward noisier steps (composition, likeness) or cleaner ones (style,
+detail), the way ai-toolkit does; **Sigmoid** is ai-toolkit's timestep type centred on the middle noise levels.
 With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 25% more speed.
 
 ## Using the LoRA

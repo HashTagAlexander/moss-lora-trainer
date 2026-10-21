@@ -124,12 +124,13 @@ DEFAULTS = {
         "batch_size": 1,
         "grad_accum": 1,
         "lr": 1e-4,
-        "optimizer": "adamw",          # adamw | adamw8bit | prodigy | adafactor
+        "optimizer": "adamw",          # adamw | adamw8bit | prodigy | adafactor | automagic3
         "weight_decay": 0.0,
         "lr_scheduler": "constant",    # constant | cosine | linear
         "warmup_steps": 0,
         "max_grad_norm": 1.0,
-        "timestep_sampling": "moss",   # moss | flux_shift | logit_normal | shift | uniform
+        "timestep_sampling": "moss",   # moss | flux_shift | fibo | sigmoid | logit_normal | shift | uniform
+        "timestep_bias": "balanced",   # balanced | high_noise | low_noise (ai-toolkit's "content" / "style")
         "shift": 3.0,
         "logit_mean": 0.0,
         "logit_std": 1.0,
@@ -235,6 +236,8 @@ def validate(cfg: dict) -> dict:
         t[key] = int(t[key])
     for key in ("lr", "weight_decay", "max_grad_norm", "shift", "logit_mean", "logit_std"):
         t[key] = float(t[key])
+    if t["timestep_bias"] not in ("balanced", "high_noise", "low_noise"):
+        raise ValueError("Timestep bias must be balanced, high_noise or low_noise.")
     if t["steps"] < 1 or t["batch_size"] < 1 or t["grad_accum"] < 1:
         raise ValueError("Steps, batch size and grad accumulation must be >= 1.")
     s = cfg["sample"]
