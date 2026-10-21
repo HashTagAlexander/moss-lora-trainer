@@ -117,6 +117,7 @@ DEFAULTS = {
         "flip": False,
         "repeats": 1,
         "caption_dropout": 0.05,
+        "context_dropout": 0.2,        # edit pairs: chance of training without the source latents (Bria's default)
     },
     "train": {
         "steps": 2000,
@@ -148,6 +149,7 @@ DEFAULTS = {
             "[trigger] standing on a city street at night, neon signs that read \"MOSS\"",
         ],
         "negative_prompt": "",
+        "sources": [],                 # edit pairs: source image per sample prompt (dataset-relative paths)
         "width": 1024,
         "height": 1024,
         "steps": 30,
@@ -237,8 +239,10 @@ def validate(cfg: dict) -> dict:
         raise ValueError("Steps, batch size and grad accumulation must be >= 1.")
     s = cfg["sample"]
     s["width"], s["height"] = int(s["width"]) // 16 * 16, int(s["height"]) // 16 * 16
-    if isinstance(s["prompts"], str):
-        s["prompts"] = [p for p in s["prompts"].splitlines() if p.strip()]
+    for key in ("prompts", "sources"):
+        if isinstance(s[key], str):
+            s[key] = [p.strip() for p in s[key].splitlines() if p.strip()]
+    cfg["data"]["context_dropout"] = float(cfg["data"]["context_dropout"])
     for key in ("every", "steps", "seed", "uncond_skip_layer"):
         s[key] = int(s[key])
     for key in ("cfg", "shift"):

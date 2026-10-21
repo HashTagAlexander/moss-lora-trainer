@@ -1,4 +1,8 @@
-"""Dataset scanning, aspect bucketing and on-disk latent / text-embedding caches."""
+"""Dataset scanning, aspect bucketing and on-disk latent / text-embedding caches.
+
+Two kinds of dataset: images with same-named .txt captions, or edit pairs listed in `edits.jsonl` (Bria's Fibo 2.0
+format: one {"sources": [...], "target": ..., "instruction": ...} per line, paths relative to the dataset folder).
+"""
 from __future__ import annotations
 
 import hashlib
@@ -13,6 +17,7 @@ import torch
 from PIL import Image, ImageOps
 from safetensors.torch import load_file, save_file
 
+from .edits import EDITS_FILE, dataset_path, edit_prompt, edit_row_problem, is_edit_dataset, read_edit_rows  # noqa: F401
 from .model import bucket_sizes, closest_bucket
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -58,6 +63,13 @@ def _trigger_json(caption: dict, trigger: str) -> str:
     had = "[trigger]" in json.dumps(caption, ensure_ascii=False)
     caption = walk(caption)
     if trigger and not had and trigger not in json.dumps(caption, ensure_ascii=False):
+        inner = caption.get("structured_caption")  # an edit prompt's caption of the result
+        if isinstance(inner, dict):
+            return json.dumps({**caption, "structured_caption": json.loads(_trigger_json(inner, trigger))},
+                              ensure_ascii=False, separators=(",", ":"))
+        if isinstance(inner, str):
+            return json.dumps({**caption, "structured_caption": f"{trigger}, {inner}" if inner else trigger},
+                              ensure_ascii=False, separators=(",", ":"))
         sd = str(caption.get("short_description") or "").strip()
         caption = {"short_description": f"{trigger}, {sd}" if sd else trigger,
                    **{k: v for k, v in caption.items() if k != "short_description"}}
@@ -223,3 +235,83 @@ class BucketSampler:
 
 def load_latent(item: Item) -> torch.Tensor:
     return load_file(str(item.latent_path))["latent"]
+
+
+# --------------------------------------------------------------------------- edit pairs (Fibo 2.0)
+
+@dataclass
+class EditItem:
+    sources: list[Path]
+    target: Path | None  # None for a sample (nothing to learn)
+    caption: str
+    area: int
+    bucket: tuple[int, int] = (0, 0)  # result size, set by cache_edit_latents
+    emb_path: Path | None = None
+    lat_path: Path | None = None
+
+
+def build_edit_items(folder: Path, resolutions: list[int], trigger: str, log=print) -> list[EditItem]:
+    items = []
+    for n, row in enumerate(read_edit_rows(folder), 1):
+        problem = edit_row_problem(folder, row)
+        if problem:
+            log(f"warning: {EDITS_FILE} pair {n} skipped: {problem}")
+            continue
+        caption = apply_trigger(edit_prompt(row["instruction"]), trigger)
+        for res in resolutions:
+            items.append(EditItem([dataset_path(folder, s) for s in row["sources"]], dataset_path(folder, row["target"]),
+                                  caption, res * res))
+    if not items:
+        raise ValueError(f"No usable edit pairs in {folder / EDITS_FILE}")
+    return items
+
+
+def load_rgb(path: Path) -> Image.Image:
+    with Image.open(path) as im:
+        return ImageOps.exif_transpose(im).convert("RGB")
+
+
+def edit_cache_paths(items: list[EditItem], cache_dir: Path, tag: str):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for it in items:
+        files = [(p.resolve(), p.stat().st_mtime_ns, p.stat().st_size) for p in it.sources + ([it.target] if it.target else [])]
+        key = _digest("edit-v1", tag, it.caption, it.area, *files)
+        it.emb_path, it.lat_path = cache_dir / f"{key}.emb.safetensors", cache_dir / f"{key}.lat.safetensors"
+
+
+def cache_edit_embeds(items: list[EditItem], backend, encoder, progress=None) -> int:
+    """The prompt as Qwen3-VL reads it together with the source images (needs the text encoder only)."""
+    todo = [it for it in items if not it.emb_path.exists()]
+    for i, it in enumerate(todo):
+        _, thumbs, _, _ = backend.edit_inputs([load_rgb(p) for p in it.sources], it.area)
+        save_file({"embeds": encoder.encode(it.caption, images=thumbs).contiguous()}, str(it.emb_path))
+        if progress:
+            progress(i + 1, len(todo))
+    return len(todo)
+
+
+def cache_edit_latents(items: list[EditItem], backend, vae, progress=None) -> int:
+    """Latents of the target ("x0") and of each source ("ctx0".."ctx3"); also sets each item's result size."""
+    todo = []
+    for it in items:
+        with Image.open(it.sources[0]) as im:
+            w, h = ImageOps.exif_transpose(im).size
+        it.bucket = backend.edit_size(w, h, it.area)
+        if not it.lat_path.exists():
+            todo.append(it)
+    for i, it in enumerate(todo):
+        crops, _, w, h = backend.edit_inputs([load_rgb(p) for p in it.sources], it.area)
+        tensors = {f"ctx{k}": backend.encode_images(vae, c)[0].float().cpu().contiguous() for k, c in enumerate(crops)}
+        if it.target is not None:
+            x0 = backend.encode_images(vae, backend.edit_target(load_rgb(it.target), w, h))
+            tensors["x0"] = x0[0].float().cpu().contiguous()
+        save_file(tensors, str(it.lat_path))
+        if progress:
+            progress(i + 1, len(todo))
+    return len(todo)
+
+
+def load_edit(item: EditItem) -> dict:
+    lat = load_file(str(item.lat_path))
+    return {"x0": lat.get("x0"), "context": [lat[f"ctx{k}"] for k in range(4) if f"ctx{k}" in lat],
+            "embeds": load_file(str(item.emb_path))["embeds"]}

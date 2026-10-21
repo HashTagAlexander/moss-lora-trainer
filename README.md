@@ -53,6 +53,13 @@ from the same page, or let them download on first use. Everything runs on diffus
 - **Generate tab**: text-to-image, or upload a **source image** to edit it (the prompt is then the edit instruction,
   or a VGL caption of the result with an `edit_instruction` key). Edit Turbo does edits in 4 steps without CFG.
   The default negative for Dev is the one from Bria's model card.
+- **Edit LoRAs**: create a dataset of type **Edit pairs** (or drop in a zip in Bria's layout: `edits.jsonl` plus
+  its images). Each pair is 1–4 source images, the target, and an instruction: a plain edit instruction, or a VGL
+  caption of the result with an `edit_instruction` key (train in the form you'll prompt with). Training follows Bria's
+  edit recipe: the prompt is encoded together with the sources, their latents condition the transformer, 20% context
+  dropout trains without them, and pairs train one at a time (batch size becomes gradient accumulation). Samples show
+  the sources next to the result; by default they're the first pairs' own instructions, or set **Sample source
+  images** (one line per sample prompt). Use the LoRA in the Generate tab with a source image.
 - **VGL editor** (Generate tab, Fibo models): a form for every VGL field with a layout canvas where objects and texts
   are boxes you drag and resize. Fibo 2.0 places things by words (`location`, `relative_size`), not coordinates, so
   boxes snap to the 3×3 grid those words describe. **Show layout** in the image viewer draws a prompt's layout over the

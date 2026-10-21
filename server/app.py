@@ -24,13 +24,15 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from mosstrainer import captioner  # noqa: E402
+from mosstrainer.edits import (EDITS_FILE, dataset_path, edit_row_problem, is_edit_dataset,  # noqa: E402
+                               read_edit_rows, write_edit_rows)
 from mosstrainer.config import (DEFAULTS, FAMILY_TARGETS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE,  # noqa: E402
                                 validate)
 
@@ -611,15 +613,30 @@ def dataset_images(folder: Path):
     return sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith("."))
 
 
+def edit_rows_or_400(folder: Path) -> list[dict]:
+    try:
+        return read_edit_rows(folder)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/datasets")
 def list_datasets():
     out = []
     for d in sorted(DATASETS.iterdir()):
         if not d.is_dir():
             continue
+        if is_edit_dataset(d):  # edit pairs (Fibo 2.0)
+            try:
+                rows = read_edit_rows(d)
+            except ValueError:
+                rows = []
+            out.append({"name": d.name, "type": "edit", "count": len(rows), "captioned": len(rows),
+                        "cover": rows[0].get("target") if rows else None})
+            continue
         imgs = dataset_images(d)
         captioned = sum(1 for p in imgs if p.with_suffix(".txt").exists())
-        out.append({"name": d.name, "count": len(imgs), "captioned": captioned,
+        out.append({"name": d.name, "type": "images", "count": len(imgs), "captioned": captioned,
                     "cover": imgs[0].name if imgs else None})
     return out
 
@@ -632,6 +649,8 @@ async def create_dataset(request: Request):
     if path.exists():
         raise HTTPException(409, "Dataset already exists")
     path.mkdir()
+    if body.get("type") == "edit":
+        write_edit_rows(path, [])
     return {"name": name}
 
 
@@ -649,12 +668,20 @@ def get_dataset(name: str):
     path = DATASETS / safe_name(name)
     if not path.is_dir():
         raise HTTPException(404)
+    if is_edit_dataset(path):
+        pairs = []
+        for i, row in enumerate(edit_rows_or_400(path)):
+            ins = row.get("instruction", "")
+            pairs.append({"i": i, "sources": row.get("sources") or [], "target": row.get("target"),
+                          "instruction": ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False, indent=2),
+                          "problem": edit_row_problem(path, row)})
+        return {"name": name, "type": "edit", "pairs": pairs}
     items = []
     for p in dataset_images(path):
         txt = p.with_suffix(".txt")
         items.append({"file": p.name, "caption": txt.read_text(encoding="utf-8") if txt.exists() else "",
                       "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)})
-    return {"name": name, "items": items}
+    return {"name": name, "type": "images", "items": items}
 
 
 def _unique(folder: Path, filename: str) -> Path:
@@ -673,11 +700,69 @@ def _clean_name(filename: str) -> str:
     return (stem or "image") + Path(filename).suffix.lower()
 
 
+def _rel_parts(rel: str) -> list[str] | None:
+    """A path inside an uploaded zip, made safe: no hidden or parent parts, clean names."""
+    parts = [p for p in rel.replace("\\", "/").split("/") if p]
+    if not parts or any(p.startswith(".") or p == ".." for p in parts):
+        return None
+    return [_clean_name(p) if i == len(parts) - 1 else "".join(c if c.isalnum() or c in "._-" else "_" for c in p)
+            for i, p in enumerate(parts)]
+
+
+def import_edit_zip(folder: Path, z: zipfile.ZipFile, jsonl: str) -> dict:
+    """Bria's layout: edits.jsonl plus the images it names, kept at their paths (relative to the jsonl)."""
+    root = jsonl[:-len(EDITS_FILE)]
+    rows = []
+    for n, line in enumerate(z.read(jsonl).decode("utf-8").splitlines(), 1):
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise HTTPException(400, f"{EDITS_FILE} line {n} isn't valid JSON: {e}")
+    images = 0
+    for info in z.infolist():
+        if info.is_dir() or not info.filename.startswith(root) or "__MACOSX" in info.filename:
+            continue
+        parts = _rel_parts(info.filename[len(root):])
+        if parts and Path(parts[-1]).suffix in IMAGE_EXTS:
+            target = folder.joinpath(*parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(z.read(info))
+            images += 1
+    for row in rows:  # paths as stored, so they match the cleaned file names
+        for key in ("sources", "target"):
+            clean = lambda r: "/".join(_rel_parts(r) or [r]) if isinstance(r, str) else r  # noqa: E731
+            row[key] = [clean(r) for r in row[key]] if isinstance(row.get(key), list) else clean(row.get(key))
+    write_edit_rows(folder, (read_edit_rows(folder) if is_edit_dataset(folder) else []) + rows)
+    return {"images": images, "captions": 0, "pairs": len(rows)}
+
+
 @app.post("/api/datasets/{name}/upload")
 async def upload(name: str, files: list[UploadFile] = File(...)):
     folder = DATASETS / safe_name(name)
     if not folder.is_dir():
         raise HTTPException(404)
+    edit = is_edit_dataset(folder)
+    datas = [(f.filename or "upload", await f.read()) for f in files]
+    zips = [(fn, zipfile.ZipFile(io.BytesIO(d))) for fn, d in datas if fn.lower().endswith(".zip")]
+    pair_zips = [(z, next((n for n in z.namelist() if n.endswith(EDITS_FILE) and "__MACOSX" not in n), None))
+                 for _, z in zips]
+    if any(j for _, j in pair_zips) or any(Path(fn).name == EDITS_FILE for fn, _ in datas):
+        if not edit and dataset_images(folder):
+            raise HTTPException(400, "This dataset holds captioned images; put edit pairs in a new dataset")
+        out = {"images": 0, "captions": 0, "pairs": 0}
+        for z, jsonl in pair_zips:
+            if jsonl:
+                for k, v in import_edit_zip(folder, z, jsonl).items():
+                    out[k] += v
+        for fn, d in datas:
+            if Path(fn).name == EDITS_FILE:
+                rows = [json.loads(line) for line in d.decode("utf-8").splitlines() if line.strip()]
+                write_edit_rows(folder, (read_edit_rows(folder) if is_edit_dataset(folder) else []) + rows)
+                out["pairs"] += len(rows)
+        return out
+    if edit:
+        raise HTTPException(400, f"This is an edit-pair dataset: use Add pair, or upload a .zip with {EDITS_FILE}")
     added, captions = 0, 0
 
     def store(filename: str, data: bytes):
@@ -702,15 +787,14 @@ async def upload(name: str, files: list[UploadFile] = File(...)):
                     captioner.caption_text(obj), encoding="utf-8")
                 captions += 1
 
-    for f in files:
-        data = await f.read()
-        if (f.filename or "").lower().endswith(".zip"):
+    for fn, data in datas:
+        if fn.lower().endswith(".zip"):
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 for info in z.infolist():
                     if not info.is_dir() and "__MACOSX" not in info.filename:
                         store(info.filename, z.read(info))
         else:
-            store(f.filename or "upload", data)
+            store(fn, data)
     return {"images": added, "captions": captions}
 
 
@@ -756,6 +840,8 @@ async def autocaption(name: str, request: Request):
     folder = DATASETS / safe_name(name)
     if not folder.is_dir():
         raise HTTPException(404)
+    if is_edit_dataset(folder):
+        raise HTTPException(400, "AI captioning is for image datasets, not edit pairs")
     body = await request.json()
     scope = body.get("scope", "missing")
     images = dataset_images(folder)
@@ -796,17 +882,90 @@ def delete_item(name: str, filename: str):
     return {"ok": True}
 
 
-@app.get("/api/datasets/{name}/image/{filename}")
+@app.post("/api/datasets/{name}/pairs")
+async def add_pair(name: str, sources: list[UploadFile] = File(...), target: UploadFile = File(...),
+                   instruction: str = Form("")):
+    """One edit pair: 1-4 source images, the target, and the instruction (plain, or a JSON caption)."""
+    folder = DATASETS / safe_name(name)
+    if not is_edit_dataset(folder):
+        raise HTTPException(400, "Not an edit-pair dataset")
+    if not 1 <= len(sources) <= 4:
+        raise HTTPException(400, "A pair needs 1 to 4 source images")
+    files = sources + [target]
+    if any(Path(_clean_name(f.filename or "x.png")).suffix not in IMAGE_EXTS for f in files):
+        raise HTTPException(400, "Sources and target have to be images")
+    rows = edit_rows_or_400(folder)
+    pairs_dir = folder / "pairs"
+    pairs_dir.mkdir(exist_ok=True)
+    n = 1 + max([int(p.name[:4]) for p in pairs_dir.iterdir() if p.name[:4].isdigit()] or [0])
+    saved = []
+    for k, f in enumerate(files):
+        suffix = Path(_clean_name(f.filename or "x.png")).suffix
+        rel = f"pairs/{n:04d}_{'tgt' if k == len(sources) else f'src{k + 1}'}{suffix}"
+        (folder / rel).write_bytes(await f.read())
+        saved.append(rel)
+    rows.append({"sources": saved[:-1], "target": saved[-1], "instruction": parse_instruction(instruction)})
+    write_edit_rows(folder, rows)
+    return {"i": len(rows) - 1}
+
+
+def parse_instruction(text: str):
+    """A JSON caption is stored as an object (as Bria's examples do), anything else as the plain instruction."""
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return text
+
+
+def pair_or_409(rows: list[dict], i: int, target: str) -> dict:
+    if not 0 <= i < len(rows) or rows[i].get("target") != target:
+        raise HTTPException(409, "The dataset changed; reload the page")
+    return rows[i]
+
+
+@app.put("/api/datasets/{name}/pairs/{i}")
+async def update_pair(name: str, i: int, request: Request):
+    folder = DATASETS / safe_name(name)
+    body = await request.json()
+    rows = edit_rows_or_400(folder)
+    pair_or_409(rows, i, body.get("target"))["instruction"] = parse_instruction(body.get("instruction", ""))
+    write_edit_rows(folder, rows)
+    return {"ok": True, "problem": edit_row_problem(folder, rows[i])}
+
+
+@app.delete("/api/datasets/{name}/pairs/{i}")
+def delete_pair(name: str, i: int, target: str):
+    folder = DATASETS / safe_name(name)
+    rows = edit_rows_or_400(folder)
+    row = pair_or_409(rows, i, target)
+    del rows[i]
+    write_edit_rows(folder, rows)
+    used = {r for other in rows for r in (other.get("sources") or []) + [other.get("target")]}
+    for rel in set((row.get("sources") or []) + [row.get("target")]) - used:  # images no other pair uses
+        path = dataset_path(folder, rel)
+        if path is not None and path.is_file():
+            path.unlink()
+    return {"ok": True}
+
+
+@app.get("/api/datasets/{name}/image/{filename:path}")
 def dataset_image(name: str, filename: str, thumb: int = 0):
     folder = DATASETS / safe_name(name)
-    img = safe_file(folder, filename)
+    img = dataset_path(folder, filename)  # edit pairs keep images in subfolders
+    if img is None or any(p.startswith(".") for p in Path(filename).parts) or img.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(400, "Invalid file name")
     if not img.exists():
         raise HTTPException(404)
     if not thumb:
         return FileResponse(img)
     thumbs = folder / ".thumbs"
     thumbs.mkdir(exist_ok=True)
-    t = thumbs / f"{img.name}.{int(img.stat().st_mtime)}.jpg"
+    t = thumbs / f"{filename.replace('/', '__')}.{int(img.stat().st_mtime)}.jpg"
     if not t.exists():
         from PIL import Image, ImageOps
         with Image.open(img) as im:
@@ -843,6 +1002,8 @@ async def create_job(request: Request):
         raise HTTPException(400, str(e))
     if not (DATASETS / cfg["dataset"]).is_dir():
         raise HTTPException(400, f"Dataset '{cfg['dataset']}' does not exist")
+    if is_edit_dataset(DATASETS / cfg["dataset"]) and not MODEL_SPECS[cfg["model"]].get("edit"):
+        raise HTTPException(400, f"'{cfg['dataset']}' holds edit pairs, which train on Fibo 2.0 Dev")
     job_dir = JOBS / cfg["name"]
     if job_dir.exists():
         if not overwrite:

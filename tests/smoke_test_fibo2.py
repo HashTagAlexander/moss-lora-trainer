@@ -11,6 +11,8 @@ Checks, against diffusers' own BriaFibo2Pipeline:
     same output as the injected LoRA and our runtime stack,
 plus the VGL helpers (trigger word in JSON captions, caption tidying), then runs the real trainer process (caching,
 training with padded batches, sampling, saving, resume) and the Generate tab's worker (text-to-image and an edit).
+Edit LoRAs: the cached inputs of an edit pair (prompt read with two source images, source and target latents) are
+checked against Bria's fine_tuning/train_lora.py pre-encoding, then an edit-pair dataset is trained and resumed.
 """
 import json
 import os
@@ -235,6 +237,112 @@ def run_trainer(tmp: Path):
     print("trainer OK, LoRA keys e.g.", keys[0])
 
 
+EDIT_ROWS = [
+    {"sources": ["src/a.png", "src/b.png"], "target": "tgt/ab.png",
+     "instruction": {"short_description": "the two squares side by side", "edit_instruction": "put <image_1> next to "
+                     "<image_2>", "text_render": [{"text": "PAIR", "location": "top", "size": "small", "color": "white",
+                                                   "font": "sans"}]}},
+    {"sources": ["src/a.png"], "target": "tgt/a_blue.png", "instruction": "make the square blue"},
+    {"sources": ["src/missing.png"], "target": "tgt/a_blue.png", "instruction": "skipped: the source is missing"},
+]
+
+
+def make_edit_dataset(ds: Path):
+    (ds / "src").mkdir(parents=True)
+    (ds / "tgt").mkdir()
+    g = torch.Generator().manual_seed(4)
+    noise = lambda w, h: Image.fromarray((torch.rand(h, w, 3, generator=g) * 255).byte().numpy())  # noqa: E731
+    noise(300, 200).save(ds / "src/a.png")
+    noise(200, 260).save(ds / "src/b.png")
+    noise(280, 210).save(ds / "tgt/ab.png")
+    noise(300, 200).save(ds / "tgt/a_blue.png")
+    (ds / "edits.jsonl").write_text("".join(json.dumps(r) + "\n" for r in EDIT_ROWS))
+
+
+def check_edit_against_bria(tmp: Path):
+    """Our cached edit inputs == Bria's trainer pre-encoding (pre_encode in fine_tuning/train_lora.py)."""
+    from diffusers import BriaFibo2Pipeline, FlowMatchEulerDiscreteScheduler
+    from diffusers.pipelines.bria_fibo2.text_images import draw_text_image
+    from mosstrainer.backends import get_backend
+    from mosstrainer.data import build_edit_items, cache_edit_embeds, cache_edit_latents, edit_cache_paths, load_edit
+
+    ds = tmp / "edit_check"
+    make_edit_dataset(ds)
+    be = get_backend("tiny-fibo2")
+    te = be.load_text_encoder("cpu")
+    te.model.float()
+    te.out_dtype = torch.float32
+    vae = be.load_vae("cpu")
+    logs = []
+    items = build_edit_items(ds, [256], "", logs.append)
+    assert len(items) == 2 and "pair 3 skipped" in logs[0], (items, logs)
+    edit_cache_paths(items, tmp / "edit_cache", be.text_cache_id)
+    cache_edit_embeds(items, be, te)
+    cache_edit_latents(items, be, vae)
+
+    pipe = BriaFibo2Pipeline(transformer=None, vae=vae, text_encoder=te.model, processor=te.pipe.processor,
+                             scheduler=FlowMatchEulerDiscreteScheduler())
+    proc, area = pipe.image_processor, 256 * 256
+    for it, row in zip(items, EDIT_ROWS):
+        ours = load_edit(it)
+        srcs = [Image.open(ds / p).convert("RGB") for p in row["sources"]]
+        target = Image.open(ds / row["target"]).convert("RGB")
+        prompt = row["instruction"] if isinstance(row["instruction"], str) else json.dumps(
+            row["instruction"], separators=(",", ":"), ensure_ascii=False)
+        width, height = proc.get_image_size(srcs[0].width / srcs[0].height, area=area)
+        vae_srcs, thumbs = proc.preprocess(srcs, height=height, width=width, area=area,
+                                           text_encoder_image_size=pipe.text_encoder_image_size)
+        caption, _ = pipe._parse_prompt(prompt)
+        texts = [draw_text_image(e["text"], []) for e in (caption.get("text_render") or [])] \
+            if isinstance(caption, dict) else []
+        with torch.no_grad():
+            emb, mask = pipe.encode_prompt(prompt, thumbs, torch.device("cpu"), text_images=texts or None)
+            refs = pipe.prepare_image_latents(vae_srcs, 1, torch.device("cpu"), torch.float32)
+            tgt, _ = proc.preprocess(target, height=height, width=width)
+            x0 = pipe.prepare_image_latents(tgt, 1, torch.device("cpu"), torch.float32)[0]
+        ref_emb = emb[0].transpose(0, 1) if mask is None else emb[0][:, mask[0]].transpose(0, 1)
+        assert it.bucket == (width, height), (it.bucket, width, height)
+        assert ours["embeds"].shape == ref_emb.shape and torch.equal(ours["embeds"], ref_emb.float())
+        assert len(ours["context"]) == len(refs) and all(torch.equal(a, b[0]) for a, b in zip(ours["context"], refs))
+        assert torch.equal(ours["x0"], x0[0])
+        print(f"edit pair ({len(srcs)} source(s), {width}x{height}): prompt tokens {ref_emb.shape[0]}, "
+              f"context {[tuple(r.shape[2:]) for r in refs]} == Bria's pre-encoding")
+
+
+def run_edit_trainer(tmp: Path):
+    ws = tmp / "workspace"
+    make_edit_dataset(ws / "datasets" / "pairs")
+    job = ws / "jobs" / "ed"
+    job.mkdir(parents=True)
+    (job / "config.json").write_text(json.dumps({
+        "name": "ed", "model": "tiny-fibo2", "dataset": "pairs", "network": {"rank": 4, "alpha": 4},
+        "data": {"resolutions": [256], "context_dropout": 0.5}, "train": {"steps": 3, "batch_size": 2, "lr": 1e-3},
+        "save": {"every": 2}, "sample": {"every": 3, "width": 256, "height": 256, "steps": 2}}))
+
+    def go():
+        r = subprocess.run([sys.executable, "-m", "mosstrainer.train", "--job-dir", str(job)], cwd=ROOT,
+                           capture_output=True, text=True, env=os.environ.copy())
+        print(r.stdout[-2000:], r.stderr[-2000:])
+        return json.loads((job / "status.json").read_text()), r.stdout
+    st, out = go()
+    assert st["state"] == "done", st
+    assert "2 edit pairs" in out and "pair 3 skipped" in out and "becomes gradient accumulation" in out, out
+    samples = json.loads((job / "samples" / "index.json").read_text())
+    assert [s["sources"] for s in samples[:2]] == [["src/a.png", "src/b.png"], ["src/a.png"]], samples
+    assert len({s["step"] for s in samples}) == 2, samples
+    with Image.open(job / "samples" / samples[-1]["file"]) as im:
+        assert im.width > im.height, im.size  # source and result side by side
+    cfg = json.loads((job / "config.json").read_text())
+    cfg["train"]["steps"] = 4
+    cfg["sample"].update(prompts=["make it green"], sources=["src/b.png, src/a.png"])
+    (job / "config.json").write_text(json.dumps(cfg))
+    st, out = go()
+    assert st["state"] == "done" and st["step"] == 4 and "resumed from step 3" in out, st
+    samples = json.loads((job / "samples" / "index.json").read_text())
+    assert samples[-1]["sources"] == ["src/b.png", "src/a.png"] and samples[-1]["prompt"] == "make it green", samples[-1]
+    print("edit trainer OK:", sorted(p.name for p in (job / "checkpoints").glob("*.safetensors")))
+
+
 def run_worker(tmp: Path):
     """Generate through the Generate tab's worker: text-to-image with the LoRA, then an edit of a source image."""
     lora = tmp / "workspace" / "jobs" / "f2" / "checkpoints" / "f2.safetensors"
@@ -275,6 +383,8 @@ def main():
         check_against_diffusers(tmp)
         run_trainer(tmp)
         run_worker(tmp)
+        check_edit_against_bria(tmp)
+        run_edit_trainer(tmp)
         print("FIBO2 SMOKE TEST PASSED")
 
 

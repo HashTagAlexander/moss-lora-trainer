@@ -571,7 +571,7 @@ async function pageNewJob(params) {
     ["Job", [
       F.text("name", "Job name", "Also used as the LoRA filename.", mode === "edit" ? "readonly" : ""),
       F.sel("model", "Base model", Object.entries(INFO.trainable), "Changing it loads that model's recommended settings. Gated models (Fibo 2.0) need a Hugging Face token in <a href=\"#/settings\">Settings</a>."),
-      F.sel("dataset", "Dataset", datasets.length ? datasets.map((d) => [d.name, `${d.name} (${d.count} images)`]) : [["", "— create a dataset first —"]],
+      F.sel("dataset", "Dataset", datasets.length ? datasets.map((d) => [d.name, `${d.name} (${d.count} ${d.type === "edit" ? "edit pairs" : "images"})`]) : [["", "— create a dataset first —"]],
         `<a href="#/datasets">Manage datasets</a>`),
       F.text("trigger_word", "Trigger word", "Prepended to captions; replaces <span class='mono'>[trigger]</span> in captions and sample prompts."),
     ]],
@@ -587,6 +587,7 @@ async function pageNewJob(params) {
         "Images are bucketed by aspect ratio at each selected area. 1024 is the model's main training resolution.", true),
       F.num("data.repeats", "Repeats", "Times each image appears per epoch.", 'min="1"'),
       F.num("data.caption_dropout", "Caption dropout", "Chance of training with an empty caption.", 'step="0.01" min="0" max="1"'),
+      F.num("data.context_dropout", "Context dropout (edit pairs)", "Chance of training without the source images' latents. Bria's recipe: 0.2.", 'step="0.01" min="0" max="1"'),
       F.bool("data.flip", "Horizontal flip augmentation", "Doubles the dataset. Avoid for text/asymmetric subjects."),
     ]],
     ["Training", [
@@ -624,7 +625,8 @@ async function pageNewJob(params) {
       F.num("sample.seed", "Seed"),
       F.num("sample.uncond_skip_layer", "Uncond skip layer", "MOSS only: negative-branch layer skip (default 22, −1 off)."),
       F.bool("sample.sample_first", "Sample before training", "Baseline images at step 0."),
-      F.area("sample.prompts", "Sample prompts", "One per line. <span class='mono'>[trigger]</span> is replaced by your trigger word. Fibo 2.0 works best with one-line VGL JSON captions."),
+      F.area("sample.prompts", "Sample prompts", "One per line. <span class='mono'>[trigger]</span> is replaced by your trigger word. Fibo 2.0 works best with one-line VGL JSON captions. Edit pairs: edit instructions."),
+      F.area("sample.sources", "Sample source images (edit pairs)", "One line per sample prompt: image paths inside the dataset, several separated by commas, e.g. <span class='mono'>pairs/0001_src1.jpg</span>. Leave empty to use the first pairs' own instructions and sources."),
       { path: "sample.negative_prompt", label: "Negative prompt", help: "Leave empty to match the official default (Fibo 2.0: the empty VGL caption).", type: "text", attrs: "", full: true },
     ]],
   ];
@@ -705,26 +707,32 @@ async function pageNewJob(params) {
 }
 
 // ------------------------------------------------------------------ datasets
+const relUrl = (rel) => rel.split("/").map(enc).join("/");
+
 async function pageDatasets() {
-  view.innerHTML = `<div class="page-head"><div><h1>Datasets</h1><div class="sub">Folders of images with matching .txt captions</div></div>
+  view.innerHTML = `<div class="page-head"><div><h1>Datasets</h1><div class="sub">Images with matching .txt captions, or edit pairs for Fibo 2.0</div></div>
     <button class="btn btn-primary" id="new-ds">${I.plus} New dataset</button></div><div id="ds"></div>`;
   $("#new-ds").onclick = async () => {
     const v = await modal({ title: "New dataset", confirm: "Create",
-      body: `<label class="field">Name<input type="text" name="name" placeholder="my_character"><span class="help">Letters, digits, . _ - only.</span></label>` });
+      body: `<label class="field">Name<input type="text" name="name" placeholder="my_character"><span class="help">Letters, digits, . _ - only.</span></label>
+        <label class="field" style="margin-top:12px">Type<select name="type"><option value="images">Images + captions (text-to-image LoRA)</option>
+          <option value="edit">Edit pairs: source → target + instruction (Fibo 2.0 edit LoRA)</option></select></label>` });
     if (!v) return;
-    await guard(() => api("/api/datasets", { method: "POST", body: { name: v.name.trim() } }));
+    await guard(() => api("/api/datasets", { method: "POST", body: { name: v.name.trim(), type: v.type } }));
     location.hash = `#/datasets/${enc(v.name.trim())}`;
   };
   const list = await api("/api/datasets");
   if (!list.length) { $("#ds").innerHTML = `<div class="card empty">${I.image}<div>No datasets yet. Create one and drop your images in.</div></div>`; return; }
   $("#ds").innerHTML = `<div class="grid grid-3">${list.map((d) => `
     <a class="card ds-card" href="#/datasets/${enc(d.name)}">
-      <div class="cover" style="${d.cover ? `background-image:url('/api/datasets/${enc(d.name)}/image/${enc(d.cover)}?thumb=1')` : ""}"></div>
-      <div class="info"><b>${esc(d.name)}</b><div class="muted" style="font-size:12px">${d.count} images · ${d.captioned} captioned</div></div></a>`).join("")}</div>`;
+      <div class="cover" style="${d.cover ? `background-image:url('/api/datasets/${enc(d.name)}/image/${relUrl(d.cover)}?thumb=1')` : ""}"></div>
+      <div class="info"><b>${esc(d.name)}</b><div class="muted" style="font-size:12px">${d.type === "edit" ? `${d.count} edit pairs` : `${d.count} images · ${d.captioned} captioned`}</div></div></a>`).join("")}</div>`;
 }
 
 async function pageDataset(name) {
   const base = `/api/datasets/${enc(name)}`;
+  const first = await api(base);
+  if (first.type === "edit") return pageEditDataset(name, first);
   view.innerHTML = `
     <div class="page-head"><div><h1>${esc(name)}</h1><div class="sub" id="ds-sub"></div></div>
       <div class="row">
@@ -910,6 +918,132 @@ async function pageDataset(name) {
     if (running) capTimer = setTimeout(() => { if (document.body.contains(el)) pollCaptions(); }, 1500);
   }
   api(`${base}/autocaption`).then((st) => { if (st.state === "running") pollCaptions(); });
+}
+
+
+// ------------------------------------------------------------------ edit-pair datasets (Fibo 2.0)
+async function pageEditDataset(name, data) {
+  const base = `/api/datasets/${enc(name)}`;
+  const img = (rel, thumb = true) => `${base}/image/${relUrl(rel)}${thumb ? "?thumb=1" : ""}`;
+  view.innerHTML = `
+    <div class="page-head"><div><h1>${esc(name)}</h1><div class="sub" id="ds-sub"></div></div>
+      <div class="row"><button class="btn" id="add-pair">${I.plus} Add pair</button>
+        <a class="btn btn-primary" href="#/new?dataset=${enc(name)}">${I.flask} Train an edit LoRA</a>
+        <button class="btn btn-ghost btn-danger" id="del-ds">${I.trash}</button></div></div>
+    <div class="dropzone" id="drop">${I.upload}<div><b>Drop a .zip with edits.jsonl and its images</b></div>
+      <div class="faint" style="font-size:12px">Bria's Fibo 2.0 format: one <span class="mono">{"sources": [...], "target": ..., "instruction": ...}</span> per line, image paths relative to the jsonl · or use Add pair</div>
+      <input type="file" id="file" multiple accept=".zip,.jsonl" hidden></div>
+    <div style="height:18px"></div><div class="pairs" id="pairs"></div>`;
+  let pairs = data.pairs;
+  const isJson = (t) => t.trimStart().startsWith("{");
+  function render() {
+    const bad = pairs.filter((p) => p.problem).length;
+    $("#ds-sub").textContent = `Edit pairs for Fibo 2.0 · ${pairs.length} pair${pairs.length === 1 ? "" : "s"}${bad ? ` · ${bad} can't be used yet` : ""}`;
+    $("#pairs").innerHTML = pairs.length ? pairs.map((p) => `
+      <div class="pair ${p.problem ? "bad" : ""}" data-i="${p.i}">
+        <div class="pair-imgs">
+          ${p.sources.map((src, k) => `<figure><img loading="lazy" src="${img(src)}" data-open="${p.i}"><figcaption>${p.sources.length > 1 ? `&lt;image_${k + 1}&gt;` : "source"}</figcaption></figure>`).join("")}
+          <span class="pair-arrow">${I.right}</span>
+          <figure><img loading="lazy" src="${img(p.target || "")}" data-open="${p.i}"><figcaption>target</figcaption></figure>
+        </div>
+        <div class="pair-side">
+          <textarea class="${isJson(p.instruction) ? "json" : ""}" placeholder="The edit instruction, e.g. “Remove the lamp.”, or a VGL caption of the result with an edit_instruction key">${esc(p.instruction)}</textarea>
+          <div class="meta"><span class="state">${p.problem ? `<span style="color:var(--red)">${esc(p.problem)}</span>` : ""}</span>
+            <button class="btn btn-sm btn-ghost btn-danger" data-del="${p.i}" title="Delete this pair">${I.trash}</button></div>
+        </div></div>`).join("")
+      : `<div class="card empty">${I.image}<div>No pairs yet. Add one, or drop a zip in Bria's format.</div></div>`;
+  }
+  render();
+  const reload = async () => { pairs = (await api(base)).pairs; render(); };
+
+  // instructions save as you type
+  const timers = new Map();
+  async function save(card) {
+    const p = pairs.find((x) => x.i === +card.dataset.i), ta = $("textarea", card);
+    const r = await guard(() => api(`${base}/pairs/${p.i}`, { method: "PUT", body: { target: p.target, instruction: ta.value } }));
+    p.instruction = ta.value; p.problem = r.problem;
+    card.classList.toggle("bad", !!r.problem);
+    $(".state", card).innerHTML = r.problem ? `<span style="color:var(--red)">${esc(r.problem)}</span>` : '<span class="saved">Saved ✓</span>';
+    ta.classList.toggle("json", isJson(ta.value));
+  }
+  $("#pairs").addEventListener("input", (e) => {
+    const card = e.target.closest(".pair");
+    if (!card) return;
+    $(".state", card).textContent = "Editing…";
+    clearTimeout(timers.get(card));
+    timers.set(card, setTimeout(() => { timers.delete(card); save(card); }, 900));
+  });
+  $("#pairs").addEventListener("focusout", (e) => {
+    const card = e.target.closest(".pair");
+    if (card && e.target.tagName === "TEXTAREA" && timers.has(card)) { clearTimeout(timers.get(card)); timers.delete(card); save(card); }
+  });
+  $("#pairs").addEventListener("click", async (e) => {
+    const del = e.target.closest("[data-del]"), open = e.target.closest("[data-open]");
+    if (del) {
+      const p = pairs.find((x) => x.i === +del.dataset.del);
+      if (!(await confirmBox("Delete pair?", "Removes the pair, and its images unless another pair uses them."))) return;
+      await guard(() => api(`${base}/pairs/${p.i}?target=${enc(p.target)}`, { method: "DELETE" }));
+      return reload();
+    }
+    if (open) {
+      const p = pairs.find((x) => x.i === +open.dataset.open);
+      const list = p.sources.map((src, k) => ({ src: img(src, false), title: p.sources.length > 1 ? `<image_${k + 1}>` : "Source", caption: p.instruction }))
+        .concat([{ src: img(p.target, false), title: "Target", caption: p.instruction }]);
+      lightbox(list, Math.max(0, list.findIndex((x) => x.src === e.target.src.replace("?thumb=1", ""))));
+    }
+  });
+
+  // add a pair
+  $("#add-pair").onclick = () => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `<div class="card modal" style="max-width:520px"><div class="card-head"><h2>Add an edit pair</h2></div>
+      <div class="card-body" style="display:grid;gap:14px">
+        <label class="field">Source image(s)<input type="file" id="p-src" accept="image/*" multiple>
+          <span class="help">1 to 4. With several, the instruction can name them &lt;image_1&gt;, &lt;image_2&gt;… in the order you pick them.</span></label>
+        <label class="field">Target (the edited result)<input type="file" id="p-tgt" accept="image/*"></label>
+        <label class="field">Instruction<textarea id="p-ins" rows="4" placeholder="e.g. Remove the lamp."></textarea>
+          <span class="help">A plain instruction, or a VGL caption of the result with an <span class="mono">edit_instruction</span> key. Train in the form you'll prompt with.</span></label></div>
+      <div class="card-body row" style="justify-content:flex-end;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" data-act="cancel">Cancel</button><button class="btn btn-primary" data-act="ok">Add pair</button></div></div>`;
+    document.body.appendChild(bg);
+    bg.addEventListener("click", async (e) => {
+      if (e.target === bg || e.target.closest("[data-act=cancel]")) return bg.remove();
+      if (!e.target.closest("[data-act=ok]")) return;
+      const srcs = [...$("#p-src", bg).files], tgt = $("#p-tgt", bg).files[0];
+      if (!srcs.length || srcs.length > 4 || !tgt) return toast("Pick 1 to 4 source images and a target", "error");
+      const fd = new FormData();
+      srcs.forEach((f) => fd.append("sources", f));
+      fd.append("target", tgt);
+      fd.append("instruction", $("#p-ins", bg).value);
+      await guard(() => api(`${base}/pairs`, { method: "POST", body: fd }), "Pair added");
+      bg.remove();
+      reload();
+    });
+  };
+
+  // zip / jsonl upload
+  async function uploadFiles(files) {
+    if (!files.length) return;
+    const fd = new FormData();
+    [...files].forEach((f) => fd.append("files", f));
+    $("#drop").classList.add("over");
+    try {
+      const r = await guard(() => api(`${base}/upload`, { method: "POST", body: fd }));
+      toast(`Added ${r.pairs} pairs (${r.images} images)`, "ok");
+    } finally { $("#drop").classList.remove("over"); reload(); }
+  }
+  const drop = $("#drop");
+  drop.onclick = () => $("#file").click();
+  $("#file").onchange = (e) => uploadFiles(e.target.files);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); };
+  $("#del-ds").onclick = async () => {
+    if (!(await confirmBox("Delete dataset?", `Permanently delete "${name}" and all its pairs.`))) return;
+    await guard(() => api(base, { method: "DELETE" }), "Dataset deleted");
+    location.hash = "#/datasets";
+  };
 }
 
 

@@ -635,15 +635,36 @@ class Fibo2Backend(Backend):
         return Image.fromarray(arr)
 
     # ---- editing (Generate tab)
-    def prepare_edit(self, vae, image, width, height):
-        """The source image as BriaFibo2Pipeline prepares it: cropped to the size Fibo 2.0 was trained at for its
-        aspect ratio (about width x height pixels). Returns (context latents, Qwen3-VL's copy, width, height)."""
+    # ---- editing (Generate tab and edit LoRAs)
+    def edit_inputs(self, images, area):
+        """Images to edit (1-4) as BriaFibo2Pipeline and Bria's trainer prepare them. The result gets the size Fibo
+        2.0 was trained at for the first image's aspect ratio, about `area` pixels; one image is cropped to it,
+        several each to their own aspect's size. Returns (VAE crops [1, 3, h, w], Qwen3-VL's copies, width, height).
+        """
         from diffusers.pipelines.bria_fibo2.image_processor import BriaFibo2ImageProcessor
         proc = BriaFibo2ImageProcessor(vae_scale_factor=self.vae_scale * self.patch)
-        width, height = proc.get_image_size(image.width / image.height, area=width * height)
-        crops, thumbs = proc.preprocess([image], height=height, width=width, area=width * height,
+        width, height = proc.get_image_size(images[0].width / images[0].height, area=area)
+        crops, thumbs = proc.preprocess(list(images), height=height, width=width, area=area,
                                         text_encoder_image_size=768)
-        return [self.encode_images(vae, crops[0])], thumbs, width, height
+        return crops, thumbs, width, height
+
+    def edit_size(self, width, height, area):
+        """(width, height) of an edit's result for a first source of this size."""
+        from diffusers.pipelines.bria_fibo2.image_processor import BriaFibo2ImageProcessor
+        return BriaFibo2ImageProcessor(vae_scale_factor=self.vae_scale * self.patch).get_image_size(width / height,
+                                                                                                    area=area)
+
+    @staticmethod
+    def edit_target(image, width, height):
+        """An edit's target image cropped to the result size, as Bria's trainer does: [1, 3, h, w] in [-1, 1]."""
+        from diffusers.pipelines.bria_fibo2.image_processor import BriaFibo2ImageProcessor
+        return BriaFibo2ImageProcessor(vae_scale_factor=16).preprocess(image, height=height, width=width)[0][0]
+
+    def prepare_edit(self, vae, image, width, height):
+        """A source image ready to edit, the result about width x height pixels at its aspect ratio.
+        Returns (context latents, Qwen3-VL's copies, width, height)."""
+        crops, thumbs, width, height = self.edit_inputs([image], width * height)
+        return [self.encode_images(vae, c) for c in crops], thumbs, width, height
 
 
 def get_backend(model_id: str) -> Backend:
