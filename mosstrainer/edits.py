@@ -3,7 +3,9 @@
 `edits.jsonl` in the dataset folder holds one pair per line:
     {"sources": ["src/0001.jpg"], "target": "tgt/0001.jpg", "instruction": "Remove the lamp."}
 with 1-4 sources and paths relative to the folder. The instruction is a plain edit instruction, or a JSON caption of
-the result with an "edit_instruction" key (as an object, or that object serialised).
+the result with an "edit_instruction" key (as an object, or that object serialised). A caption file next to the
+target (`tgt/0001.txt`, or `tgt/0001.json`) holds the instruction instead when it isn't empty; the sources' caption
+files are never read.
 """
 from __future__ import annotations
 
@@ -56,6 +58,32 @@ def edit_prompt(instruction) -> str:
     return str(instruction or "").strip()
 
 
+CAPTION_EXTS = (".txt", ".json")
+
+
+def caption_file(folder: Path, row: dict) -> Path | None:
+    """The caption file next to the pair's target (target.txt, else target.json), if there is one."""
+    target = dataset_path(folder, row.get("target"))
+    if target is None:
+        return None
+    for ext in CAPTION_EXTS:
+        path = target.with_suffix(ext)
+        if path != target and path.is_file():
+            return path
+    return None
+
+
+def pair_prompt(folder: Path, row: dict) -> str:
+    """The pair's instruction: its target's caption file when that isn't empty, else the row's "instruction"."""
+    path = caption_file(folder, row)
+    if path is not None:
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            obj = _json_object(text)
+            return edit_prompt(obj if obj is not None else text)
+    return edit_prompt(row.get("instruction"))
+
+
 def dataset_path(folder: Path, rel) -> Path | None:
     """A path from edits.jsonl, if it stays inside the dataset folder."""
     if not isinstance(rel, str) or not rel.strip():
@@ -73,9 +101,9 @@ def edit_row_problem(folder: Path, row: dict) -> str | None:
         path = dataset_path(folder, rel)
         if path is None or not path.is_file():
             return f"image not found: {rel}"
-    prompt = edit_prompt(row.get("instruction"))
+    prompt = pair_prompt(folder, row)
     if not prompt:
-        return "no instruction"
+        return "no instruction (in edits.jsonl or a .txt next to the target)"
     obj = _json_object(prompt)
     if obj is not None:
         if "edit_instruction" not in obj:

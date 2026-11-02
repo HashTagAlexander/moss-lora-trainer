@@ -242,7 +242,7 @@ EDIT_ROWS = [
      "instruction": {"short_description": "the two squares side by side", "edit_instruction": "put <image_1> next to "
                      "<image_2>", "text_render": [{"text": "PAIR", "location": "top", "size": "small", "color": "white",
                                                    "font": "sans"}]}},
-    {"sources": ["src/a.png"], "target": "tgt/a_blue.png", "instruction": "make the square blue"},
+    {"sources": ["src/a.png"], "target": "tgt/a_blue.png"},  # instruction in tgt/a_blue.txt
     {"sources": ["src/missing.png"], "target": "tgt/a_blue.png", "instruction": "skipped: the source is missing"},
 ]
 
@@ -256,6 +256,8 @@ def make_edit_dataset(ds: Path):
     noise(200, 260).save(ds / "src/b.png")
     noise(280, 210).save(ds / "tgt/ab.png")
     noise(300, 200).save(ds / "tgt/a_blue.png")
+    (ds / "tgt/a_blue.txt").write_text("make the square blue\n")
+    (ds / "src/a.txt").write_text("a source caption, which is never read")
     (ds / "edits.jsonl").write_text("".join(json.dumps(r) + "\n" for r in EDIT_ROWS))
 
 
@@ -287,8 +289,8 @@ def check_edit_against_bria(tmp: Path):
         ours = load_edit(it)
         srcs = [Image.open(ds / p).convert("RGB") for p in row["sources"]]
         target = Image.open(ds / row["target"]).convert("RGB")
-        prompt = row["instruction"] if isinstance(row["instruction"], str) else json.dumps(
-            row["instruction"], separators=(",", ":"), ensure_ascii=False)
+        ins = row.get("instruction") or (ds / row["target"]).with_suffix(".txt").read_text().strip()
+        prompt = ins if isinstance(ins, str) else json.dumps(ins, separators=(",", ":"), ensure_ascii=False)
         width, height = proc.get_image_size(srcs[0].width / srcs[0].height, area=area)
         vae_srcs, thumbs = proc.preprocess(srcs, height=height, width=width, area=area,
                                            text_encoder_image_size=pipe.text_encoder_image_size)

@@ -17,7 +17,8 @@ import torch
 from PIL import Image, ImageOps
 from safetensors.torch import load_file, save_file
 
-from .edits import EDITS_FILE, dataset_path, edit_prompt, edit_row_problem, is_edit_dataset, read_edit_rows  # noqa: F401
+from .edits import (EDITS_FILE, dataset_path, edit_row_problem, is_edit_dataset, pair_prompt,  # noqa: F401
+                    read_edit_rows)
 from .model import bucket_sizes, closest_bucket
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -31,6 +32,7 @@ class Item:
     flip: bool = False
     latent_path: Path | None = None
     text_key: str = ""
+    mask: Path | None = None  # <stem>-masklabel.png, when masked training is on
 
 
 def read_caption(image: Path) -> str:
@@ -90,11 +92,25 @@ def apply_trigger(caption: str, trigger: str) -> str:
     return f"{trigger}, {caption}" if caption else trigger
 
 
+MASK_SUFFIX = "-masklabel"  # OneTrainer's naming: photo.jpg -> photo-masklabel.png (white = train on this)
+
+
+def is_mask(path: Path) -> bool:
+    return path.stem.endswith(MASK_SUFFIX)
+
+
+def mask_path(image: Path) -> Path | None:
+    path = image.with_name(image.stem + MASK_SUFFIX + ".png")
+    return path if path.is_file() else None
+
+
 def list_images(folder: Path) -> list[Path]:
-    return sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith("."))
+    return sorted(p for p in folder.iterdir()
+                  if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith(".") and not is_mask(p))
 
 
-def build_items(folder: Path, resolutions: list[int], trigger: str, flip: bool, log=print) -> list[Item]:
+def build_items(folder: Path, resolutions: list[int], trigger: str, flip: bool, log=print,
+                masks: bool = False) -> list[Item]:
     images = list_images(folder)
     if not images:
         raise ValueError(f"No images found in {folder}")
@@ -106,14 +122,18 @@ def build_items(folder: Path, resolutions: list[int], trigger: str, flip: bool, 
         caption = apply_trigger(read_caption(path), trigger)
         if not caption:
             log(f"warning: {path.name} has no caption and no trigger word")
+        mask = mask_path(path) if masks else None
         for res in resolutions:
             # Skip resolutions that would upscale a small image by more than ~1.4x per side.
             if len(resolutions) > 1 and w * h < 0.5 * res * res:
                 continue
             bucket = closest_bucket(w, h, buckets[res])
-            items.append(Item(path, caption, bucket))
+            items.append(Item(path, caption, bucket, mask=mask))
             if flip:
-                items.append(Item(path, caption, bucket, flip=True))
+                items.append(Item(path, caption, bucket, flip=True, mask=mask))
+    if masks:
+        n = len({it.image for it in items if it.mask})
+        log(f"masks: {n} of {len(images)} images have one" + ("" if n else " (masked training needs <name>-masklabel.png)"))
     return items
 
 
@@ -125,16 +145,32 @@ def load_pixels(path: Path, bucket: tuple[int, int], flip: bool) -> torch.Tensor
             im = im.convert("RGBA")
             bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
             im = Image.alpha_composite(bg, im)
-        im = im.convert("RGB")
-        scale = max(bw / im.width, bh / im.height)
-        nw, nh = max(bw, round(im.width * scale)), max(bh, round(im.height * scale))
-        im = im.resize((nw, nh), Image.LANCZOS)
-        left, top = (nw - bw) // 2, (nh - bh) // 2
-        im = im.crop((left, top, left + bw, top + bh))
-        if flip:
-            im = ImageOps.mirror(im)
+        im = _cover_crop(im.convert("RGB"), bucket, flip)
         t = torch.frombuffer(bytearray(im.tobytes()), dtype=torch.uint8).view(bh, bw, 3)
     return t.permute(2, 0, 1).float().div(127.5).sub(1.0)
+
+
+def _cover_crop(im: Image.Image, bucket: tuple[int, int], flip: bool) -> Image.Image:
+    """Scale to cover the bucket, centre-crop, optionally mirror (images and their masks alike)."""
+    bw, bh = bucket
+    scale = max(bw / im.width, bh / im.height)
+    nw, nh = max(bw, round(im.width * scale)), max(bh, round(im.height * scale))
+    im = im.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - bw) // 2, (nh - bh) // 2
+    im = im.crop((left, top, left + bw, top + bh))
+    return ImageOps.mirror(im) if flip else im
+
+
+def load_mask(item: Item, size: tuple[int, int], floor: float) -> torch.Tensor:
+    """The item's loss weights on the latent grid [h, w]: the mask cropped like its image, averaged down to the
+    latents, raised to `floor` outside it, then scaled to mean 1 so every picture counts the same however much
+    of it is masked (Fizgig's rule)."""
+    with Image.open(item.mask) as im:
+        im = _cover_crop(ImageOps.exif_transpose(im).convert("L"), item.bucket, item.flip)
+    m = torch.frombuffer(bytearray(im.tobytes()), dtype=torch.uint8).view(im.height, im.width).float().div(255)
+    m = torch.nn.functional.interpolate(m[None, None], size=size, mode="area")[0, 0]
+    w = m.clamp(min=floor, max=1.0)
+    return w / w.mean().clamp(min=1e-6)
 
 
 def _digest(*parts) -> str:
@@ -257,7 +293,7 @@ def build_edit_items(folder: Path, resolutions: list[int], trigger: str, log=pri
         if problem:
             log(f"warning: {EDITS_FILE} pair {n} skipped: {problem}")
             continue
-        caption = apply_trigger(edit_prompt(row["instruction"]), trigger)
+        caption = apply_trigger(pair_prompt(folder, row), trigger)
         for res in resolutions:
             items.append(EditItem([dataset_path(folder, s) for s in row["sources"]], dataset_path(folder, row["target"]),
                                   caption, res * res))
@@ -271,20 +307,26 @@ def load_rgb(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(im).convert("RGB")
 
 
-def edit_cache_paths(items: list[EditItem], cache_dir: Path, tag: str):
+def edit_cache_paths(items: list[EditItem], cache_dir: Path, tag: str, negative: str = ""):
     cache_dir.mkdir(parents=True, exist_ok=True)
     for it in items:
         files = [(p.resolve(), p.stat().st_mtime_ns, p.stat().st_size) for p in it.sources + ([it.target] if it.target else [])]
-        key = _digest("edit-v1", tag, it.caption, it.area, *files)
+        key = _digest("edit-v2", tag, it.caption, it.area, negative if it.target is None else "", *files)
         it.emb_path, it.lat_path = cache_dir / f"{key}.emb.safetensors", cache_dir / f"{key}.lat.safetensors"
 
 
-def cache_edit_embeds(items: list[EditItem], backend, encoder, progress=None) -> int:
-    """The prompt as Qwen3-VL reads it together with the source images (needs the text encoder only)."""
+def cache_edit_embeds(items: list[EditItem], backend, encoder, progress=None, negative: str = "") -> int:
+    """The prompt as Qwen3-VL reads it together with the source images (needs the text encoder only). Models that
+    see the sources in dropped captions and negatives too (Krea 2) also get "null_embeds" (the empty prompt) for
+    pairs and "neg_embeds" (the negative) for samples, both with the images."""
     todo = [it for it in items if not it.emb_path.exists()]
     for i, it in enumerate(todo):
         _, thumbs, _, _ = backend.edit_inputs([load_rgb(p) for p in it.sources], it.area)
-        save_file({"embeds": encoder.encode(it.caption, images=thumbs).contiguous()}, str(it.emb_path))
+        tensors = {"embeds": encoder.encode(it.caption, images=thumbs).contiguous()}
+        if backend.edit_null_with_images:
+            key, text = ("neg_embeds", negative) if it.target is None else ("null_embeds", "")
+            tensors[key] = encoder.encode(text, images=thumbs).contiguous()
+        save_file(tensors, str(it.emb_path))
         if progress:
             progress(i + 1, len(todo))
     return len(todo)
@@ -312,6 +354,6 @@ def cache_edit_latents(items: list[EditItem], backend, vae, progress=None) -> in
 
 
 def load_edit(item: EditItem) -> dict:
-    lat = load_file(str(item.lat_path))
+    lat, emb = load_file(str(item.lat_path)), load_file(str(item.emb_path))
     return {"x0": lat.get("x0"), "context": [lat[f"ctx{k}"] for k in range(4) if f"ctx{k}" in lat],
-            "embeds": load_file(str(item.emb_path))["embeds"]}
+            "embeds": emb["embeds"], "null_embeds": emb.get("null_embeds"), "neg_embeds": emb.get("neg_embeds")}

@@ -342,7 +342,7 @@ function lossChart(el) {
 const CKPT_NOTE = {
   moss: 'LoRA files use ComfyUI-compatible keys (<span class="mono">diffusion_model.layers.N.proj.*</span>). Load with a standard LoraLoaderModelOnly node on top of the MOSS-Image loader, or use <span class="mono">generate.py</span>.',
   krea2: 'LoRA files are in diffusers format (<span class="mono">transformer.transformer_blocks.N.*</span>), loadable by diffusers\' Krea2Pipeline and ComfyUI.',
-  fibo2: 'LoRA files are in diffusers format (<span class="mono">transformer.layers.N.*</span>). Load with <span class="mono">pipe.transformer.load_lora_adapter(folder, weight_name="&lt;file&gt;.safetensors")</span> on BriaFibo2Pipeline; they work on Fibo 2.0 Dev and Edit Turbo.',
+  fibo2: 'Download is the diffusers format (<span class="mono">transformer.layers.N.*</span>): load with <span class="mono">pipe.transformer.load_lora_adapter(folder, weight_name="&lt;file&gt;.safetensors")</span> on BriaFibo2Pipeline. <b>ComfyUI</b> is the same LoRA in the fused layout of Comfy-Org\'s Fibo 2.0 files, for a LoraLoaderModelOnly node. Both work on Dev and Edit Turbo. LoKr files load in this trainer\'s Generate tab; ComfyUI can\'t apply them to its fused Fibo layers.',
 };
 
 async function pageJob(name) {
@@ -423,7 +423,7 @@ async function pageJob(name) {
     if (!job.checkpoints.length) { el.innerHTML = `<div class="empty">No checkpoints saved yet</div>`; return; }
     el.innerHTML = `<table><thead><tr><th>File</th><th>Size</th><th>Saved</th><th></th></tr></thead><tbody>
       ${job.checkpoints.slice().sort((a, b) => b.mtime - a.mtime).map((c) => `<tr><td class="mono">${esc(c.file)}</td><td class="muted">${fmtBytes(c.size)}</td>
-      <td class="muted">${timeAgo(c.mtime)}</td><td style="text-align:right"><a class="btn btn-sm" href="#/generate?lora=${enc(`jobs/${name}/checkpoints/${c.file}`)}">${I.spark} Generate</a> <a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}" download>${I.download} Download</a></td></tr>`).join("")}
+      <td class="muted">${timeAgo(c.mtime)}</td><td style="text-align:right"><a class="btn btn-sm" href="#/generate?lora=${enc(`jobs/${name}/checkpoints/${c.file}`)}">${I.spark} Generate</a> <a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}" download>${I.download} Download</a>${c.comfyui ? ` <a class="btn btn-sm" href="${base}/checkpoint/${enc(c.file)}?variant=comfyui" download="${esc(c.file.replace(/\.safetensors$/, "_comfyui.safetensors"))}" title="The same LoRA in ComfyUI's layout">${I.download} ComfyUI</a>` : ""}</td></tr>`).join("")}
       </tbody></table><div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">${CKPT_NOTE[family] || CKPT_NOTE.moss}</div>`;
   }
 
@@ -576,6 +576,8 @@ async function pageNewJob(params) {
       F.text("trigger_word", "Trigger word", "Prepended to captions; replaces <span class='mono'>[trigger]</span> in captions and sample prompts."),
     ]],
     ["Network", [
+      F.sel("network.type", "Adapter", [["lora", "LoRA"], ["lokr", "LoKr (Kronecker)"]], "LoKr (LyCORIS): delta W = kron(w1, w2), often holds likeness and style with fewer parameters. Rank, alpha and dropout are LoRA-only."),
+      F.num("network.lokr_factor", "LoKr factor", "w1 is about factor × factor and w2 takes the rest; smaller = bigger w2 = more capacity. 8 is a good start; −1 = as square as possible.", 'step="1" min="-1"'),
       F.num("network.rank", "Rank", "16–64 is typical for characters / styles.", 'min="1" max="512"'),
       F.num("network.alpha", "Alpha", "Scale = alpha / rank.", 'step="any"'),
       F.num("network.dropout", "Dropout", "", 'step="0.01" min="0" max="0.5"'),
@@ -589,6 +591,8 @@ async function pageNewJob(params) {
       F.num("data.caption_dropout", "Caption dropout", "Chance of training with an empty caption.", 'step="0.01" min="0" max="1"'),
       F.num("data.context_dropout", "Context dropout (edit pairs)", "Chance of training without the source images' latents. Bria's recipe: 0.2.", 'step="0.01" min="0" max="1"'),
       F.bool("data.flip", "Horizontal flip augmentation", "Doubles the dataset. Avoid for text/asymmetric subjects."),
+      F.bool("data.masks", "Masked training", "Train on the white part of each image's <span class='mono'>&lt;name&gt;-masklabel.png</span> (make them in the dataset viewer). Images without a mask train as usual."),
+      F.num("data.mask_floor", "Mask floor", "How much the rest of the picture still counts: 0 ignores it, 0.1 (default) keeps a little context.", 'step="0.05" min="0" max="1"'),
     ]],
     ["Training", [
       F.num("train.steps", "Steps", "", 'min="1"'),
@@ -713,13 +717,13 @@ async function pageNewJob(params) {
 const relUrl = (rel) => rel.split("/").map(enc).join("/");
 
 async function pageDatasets() {
-  view.innerHTML = `<div class="page-head"><div><h1>Datasets</h1><div class="sub">Images with matching .txt captions, or edit pairs for Fibo 2.0</div></div>
+  view.innerHTML = `<div class="page-head"><div><h1>Datasets</h1><div class="sub">Images with matching .txt captions, or edit pairs (Fibo 2.0, Krea 2 / Kroma)</div></div>
     <button class="btn btn-primary" id="new-ds">${I.plus} New dataset</button></div><div id="ds"></div>`;
   $("#new-ds").onclick = async () => {
     const v = await modal({ title: "New dataset", confirm: "Create",
       body: `<label class="field">Name<input type="text" name="name" placeholder="my_character"><span class="help">Letters, digits, . _ - only.</span></label>
         <label class="field" style="margin-top:12px">Type<select name="type"><option value="images">Images + captions (text-to-image LoRA)</option>
-          <option value="edit">Edit pairs: source → target + instruction (Fibo 2.0 edit LoRA)</option></select></label>` });
+          <option value="edit">Edit pairs: source → target + instruction (edit LoRA for Fibo 2.0, Krea 2 / Kroma)</option></select></label>` });
     if (!v) return;
     await guard(() => api("/api/datasets", { method: "POST", body: { name: v.name.trim(), type: v.type } }));
     location.hash = `#/datasets/${enc(v.name.trim())}`;
@@ -741,9 +745,11 @@ async function pageDataset(name) {
       <div class="row">
         <select id="bulk" style="width:auto"><option value="">Bulk caption…</option><option value="prepend">Prepend text</option><option value="append">Append text</option><option value="replace">Find & replace</option><option value="fill_empty">Fill empty captions</option></select>
         <button class="btn" id="vlm" title="Write captions with a vision model (OpenRouter): natural language or Fibo 2.0 VGL">${I.spark} Caption with AI</button>
+        <button class="btn" id="mk-masks" title="Masks for masked training, made from words">${I.image} Make masks</button>
+        <label class="check" title="Show each image's training mask"><input type="checkbox" id="show-masks"> Masks</label>
         <a class="btn btn-primary" href="#/new?dataset=${enc(name)}">${I.flask} Train on this</a>
         <button class="btn btn-ghost btn-danger" id="del-ds">${I.trash}</button></div></div>
-    <div class="dropzone" id="drop">${I.upload}<div><b>Drop images, .txt/.json captions or a .zip here</b></div><div class="faint" style="font-size:12px">or click to browse · captions pair with images by filename</div>
+    <div class="dropzone" id="drop">${I.upload}<div><b>Drop images, .txt/.json captions or a .zip here</b></div><div class="faint" style="font-size:12px">or click to browse · captions pair with images by filename · masks too: <span class="mono">photo-masklabel.png</span> (white = train on this)</div>
       <input type="file" id="file" multiple accept="image/*,.txt,.json,.zip" hidden></div>
     <div id="cap-run"></div>
     <div style="height:18px"></div><div class="items" id="items"></div>`;
@@ -758,6 +764,9 @@ async function pageDataset(name) {
     $("#items").innerHTML = items.length ? items.map((it, i) => `
       <div class="item ${it.caption.trim() ? "" : "nocap"}" data-file="${esc(it.file)}">
         <div class="img-wrap"><img loading="lazy" src="${base}/image/${enc(it.file)}?thumb=1&v=${it.mtime}" data-i="${i}">
+          ${it.mask ? `<img class="mask-ov" loading="lazy" src="${base}/image/${enc(it.mask)}?thumb=1&v=${it.mask_mtime}" alt="">
+            <button class="btn btn-sm mask-del" data-mask-del="${esc(it.file)}" title="Delete this mask">${I.x} mask</button>
+            <span class="mask-badge" title="Has a training mask">mask</span>` : ""}
           <button class="btn btn-sm vlm" data-vlm="${esc(it.file)}" title="Caption this image with AI">${I.spark}</button>
           <button class="btn btn-sm del" data-del="${esc(it.file)}">${I.trash}</button></div>
         <textarea placeholder="Write a caption…" class="${isJson(it.caption) ? "json" : ""}">${esc(it.caption)}</textarea>
@@ -921,6 +930,43 @@ async function pageDataset(name) {
     if (running) capTimer = setTimeout(() => { if (document.body.contains(el)) pollCaptions(); }, 1500);
   }
   api(`${base}/autocaption`).then((st) => { if (st.state === "running") pollCaptions(); });
+
+  // ---- masks for masked training (CLIPSeg, from words)
+  $("#show-masks").onchange = (e) => $("#items").classList.toggle("show-masks", e.target.checked);
+  $("#items").addEventListener("click", async (e) => {
+    const md = e.target.closest("[data-mask-del]");
+    if (!md) return;
+    await guard(() => api(`${base}/mask/${enc(md.dataset.maskDel)}`, { method: "DELETE" }), "Mask deleted");
+    load();
+  });
+  $("#mk-masks").onclick = async () => {
+    const without = items.filter((i) => !i.mask).length;
+    const v = await modal({ title: "Make masks", confirm: "Make masks", body: `
+      <p class="muted" style="margin:0 0 12px">Finds what you name in each picture with CLIPSeg (runs on this machine, about 600 MB downloaded once) and saves a mask beside it. With <b>Masked training</b> on, training then counts that part fully and the rest at the mask floor. CLIPSeg's masks are soft and coarse, which is fine for this; for exact masks, paint your own and drop them in as <span class="mono">photo-masklabel.png</span>.</p>
+      <label class="field">Keep<input type="text" name="keep" value="person"><span class="help">Comma-separated, e.g. “person”, “woman with red hair”, “face, hair”, “the dog”.</span></label>
+      <label class="field" style="margin-top:12px">Leave out<input type="text" name="remove" placeholder="e.g. text, watermark"><span class="help">Optional.</span></label>
+      <label class="field" style="margin-top:12px">Images<select name="overwrite"><option value="">Images without a mask (${without})</option><option value="1">All images (${items.length}), replacing masks</option></select></label>` });
+    if (!v) return;
+    await guard(() => api(`${base}/automask`, { method: "POST", body: { keep: v.keep, remove: v.remove, overwrite: !!v.overwrite } }), "Making masks");
+    pollMasks();
+  };
+  let maskTimer = null, maskSeen = -1;
+  async function pollMasks() {
+    const st = await api(`${base}/automask`);
+    const el = $("#cap-run");
+    if (!el || st.state === "idle") return;
+    const running = st.state === "running";
+    el.innerHTML = `<div class="card cap-run"><div class="card-body">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px"><div>${running ? `Making masks of “${esc(st.keep)}”…` : st.state === "error" ? "Making masks failed" : "Masks done"}
+        <span class="muted">${st.done}/${st.total ?? "?"}${st.message ? ` · ${esc(st.message)}` : ""}</span></div>
+        ${running ? "" : `<button class="btn btn-sm btn-ghost" id="mask-close">${I.x}</button>`}</div>
+      <div class="progress big"><div style="width:${st.total ? (100 * st.done) / st.total : 0}%"></div></div></div></div>`;
+    $("#mask-close")?.addEventListener("click", () => { el.innerHTML = ""; });
+    if (st.done !== maskSeen) { maskSeen = st.done; await load(); $("#show-masks").checked = true; $("#items").classList.add("show-masks"); }
+    clearTimeout(maskTimer);
+    if (running) maskTimer = setTimeout(() => { if (document.body.contains(el)) pollMasks(); }, 2000);
+  }
+  api(`${base}/automask`).then((st) => { if (st.state === "running") pollMasks(); });
 }
 
 
@@ -933,15 +979,15 @@ async function pageEditDataset(name, data) {
       <div class="row"><button class="btn" id="add-pair">${I.plus} Add pair</button>
         <a class="btn btn-primary" href="#/new?dataset=${enc(name)}">${I.flask} Train an edit LoRA</a>
         <button class="btn btn-ghost btn-danger" id="del-ds">${I.trash}</button></div></div>
-    <div class="dropzone" id="drop">${I.upload}<div><b>Drop a .zip with edits.jsonl and its images</b></div>
-      <div class="faint" style="font-size:12px">Bria's Fibo 2.0 format: one <span class="mono">{"sources": [...], "target": ..., "instruction": ...}</span> per line, image paths relative to the jsonl · or use Add pair</div>
-      <input type="file" id="file" multiple accept=".zip,.jsonl" hidden></div>
+    <div class="dropzone" id="drop">${I.upload}<div><b>Drop a .zip with edits.jsonl and its images, or .txt captions for the targets</b></div>
+      <div class="faint" style="font-size:12px">Bria's format: one <span class="mono">{"sources": [...], "target": ..., "instruction": ...}</span> per line, image paths relative to the jsonl · a <span class="mono">.txt</span> named like a target (<span class="mono">tgt/0001.png</span> → <span class="mono">tgt/0001.txt</span>) holds that pair's instruction instead · or use Add pair</div>
+      <input type="file" id="file" multiple accept=".zip,.jsonl,.txt,.json" hidden></div>
     <div style="height:18px"></div><div class="pairs" id="pairs"></div>`;
   let pairs = data.pairs;
   const isJson = (t) => t.trimStart().startsWith("{");
   function render() {
     const bad = pairs.filter((p) => p.problem).length;
-    $("#ds-sub").textContent = `Edit pairs for Fibo 2.0 · ${pairs.length} pair${pairs.length === 1 ? "" : "s"}${bad ? ` · ${bad} can't be used yet` : ""}`;
+    $("#ds-sub").textContent = `Edit pairs (Fibo 2.0, Krea 2 / Kroma) · ${pairs.length} pair${pairs.length === 1 ? "" : "s"}${bad ? ` · ${bad} can't be used yet` : ""}`;
     $("#pairs").innerHTML = pairs.length ? pairs.map((p) => `
       <div class="pair ${p.problem ? "bad" : ""}" data-i="${p.i}">
         <div class="pair-imgs">
@@ -951,7 +997,7 @@ async function pageEditDataset(name, data) {
         </div>
         <div class="pair-side">
           <textarea class="${isJson(p.instruction) ? "json" : ""}" placeholder="The edit instruction, e.g. “Remove the lamp.”, or a VGL caption of the result with an edit_instruction key">${esc(p.instruction)}</textarea>
-          <div class="meta"><span class="state">${p.problem ? `<span style="color:var(--red)">${esc(p.problem)}</span>` : ""}</span>
+          <div class="meta"><span class="state">${p.problem ? `<span style="color:var(--red)">${esc(p.problem)}</span>` : p.caption_file ? `from <span class="mono">${esc(p.caption_file)}</span>` : ""}</span>
             <button class="btn btn-sm btn-ghost btn-danger" data-del="${p.i}" title="Delete this pair">${I.trash}</button></div>
         </div></div>`).join("")
       : `<div class="card empty">${I.image}<div>No pairs yet. Add one, or drop a zip in Bria's format.</div></div>`;
@@ -1033,7 +1079,8 @@ async function pageEditDataset(name, data) {
     $("#drop").classList.add("over");
     try {
       const r = await guard(() => api(`${base}/upload`, { method: "POST", body: fd }));
-      toast(`Added ${r.pairs} pairs (${r.images} images)`, "ok");
+      toast(r.pairs ? `Added ${r.pairs} pairs (${r.images} images${r.captions ? `, ${r.captions} captions` : ""})`
+        : `Added ${r.captions} target captions${r.unmatched && r.unmatched.length ? `; no target named like ${r.unmatched.slice(0, 3).join(", ")}` : ""}`, "ok");
     } finally { $("#drop").classList.remove("over"); reload(); }
   }
   const drop = $("#drop");
@@ -1150,18 +1197,18 @@ async function pageGenerate(params) {
   };
   let prevModel = st.model;
 
-  // ---- source image (Fibo 2.0 edits)
+  // ---- source image (edits: Fibo 2.0, Krea 2 / Kroma)
   function renderSource() {
-    const edit = !!(INFO.model_specs[st.model] || {}).edit;
+    const edit = !!(INFO.model_specs[st.model] || {}).edit, fibo = family() === "fibo2", fiboTurbo = st.model === "briaai/Fibo-2.0-edit-turbo";
     $("#g-vgl").hidden = family() !== "fibo2";
     $("#g-src-field").hidden = !edit;
     $("#g-prompt").placeholder = edit
-      ? (st.image ? "The edit instruction, e.g. “Make the jacket red leather”… (⌘/Ctrl + Enter)" : "Describe the image, or paste a VGL JSON caption… (⌘/Ctrl + Enter)")
+      ? (st.image ? "The edit instruction, e.g. “Make the jacket red leather”… (⌘/Ctrl + Enter)" : fibo ? "Describe the image, or paste a VGL JSON caption… (⌘/Ctrl + Enter)" : "Describe the image… (⌘/Ctrl + Enter to generate)")
       : "Describe the image… (⌘/Ctrl + Enter to generate)";
     $("#g-src").innerHTML = st.image
       ? `<div class="src-img"><img src="/api/generations/input/${enc(st.image)}"><button class="btn btn-sm" id="g-src-remove" title="Remove">${I.x}</button></div>
-         <div class="help" style="margin-top:4px">The result keeps the source's aspect ratio at about the size set below.${st.model.includes("turbo") ? "" : " Edit Turbo does this in 4 steps."}</div>`
-      : `<div class="faint" style="font-size:12px">None: text-to-image${st.model.includes("turbo") ? ". Edit Turbo is made for editing; text-to-image works best on Fibo 2.0 Dev." : ""}</div>`;
+         <div class="help" style="margin-top:4px">The result keeps the source's aspect ratio at about the size set below.${fibo ? (fiboTurbo ? "" : " Edit Turbo does this in 4 steps.") : " Krea 2 edits need an edit LoRA (trained here or ostris-style); the base model doesn't know reference images."}</div>`
+      : `<div class="faint" style="font-size:12px">None: text-to-image${fiboTurbo ? ". Edit Turbo is made for editing; text-to-image works best on Fibo 2.0 Dev." : ""}</div>`;
   }
   renderSource();
   $("#g-vgl").onclick = async () => {

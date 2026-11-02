@@ -6,7 +6,7 @@ Library output is redirected to stderr so it can't corrupt the event stream.
 Requests:
   {"cmd": "generate", "id", "model", "prompt", "negative", "width", "height", "steps", "cfg",
    "shift", "seed", "count", "skip_layer", "loras": [{"path", "strength", "name"}], "low_vram", "out_dir",
-   "image" (optional source image path to edit; Fibo 2.0), "image_id"}
+   "image" (optional source image path to edit; Fibo 2.0, Krea 2), "image_id"}
   {"cmd": "offload"}   move the text encoder to CPU (e.g. because training started)
 SIGUSR1 cancels the generation in progress. The worker exits after `--idle` seconds without requests.
 """
@@ -136,9 +136,9 @@ class Worker:
         width, height = int(req["width"]) // 16 * 16, int(req["height"]) // 16 * 16
         extra = {}
         emit(event="status", state="generating", message="Encoding prompt…")
-        if req.get("image"):  # edit a source image (Fibo 2.0): it conditions the prompt and the transformer
+        if req.get("image"):  # edit a source image (Fibo 2.0, Krea 2): it conditions the prompt and the transformer
             if not self.backend.supports_edit:
-                raise ValueError("This model can't edit images; remove the source image or pick a Fibo 2.0 model.")
+                raise ValueError("This model can't edit images; remove the source image or pick a Fibo 2.0 or Krea 2 model.")
             from PIL import Image, ImageOps
             src = Path(req["image"])
             with Image.open(src) as im:
@@ -151,7 +151,10 @@ class Worker:
             early = self.backend.prompt_parts(req["prompt"])[1]
             if early:
                 extra["early"] = self.encode(early, low_vram)
-        neg = self.encode(self.backend.negative_prompt(req.get("negative") or ""), low_vram)
+        if req.get("image") and self.backend.edit_null_with_images:  # the negative sees the source too (Krea 2)
+            neg = self.encode(req.get("negative") or "", low_vram, images=thumbs, key="neg\x00" + key)
+        else:
+            neg = self.encode(self.backend.negative_prompt(req.get("negative") or ""), low_vram)
 
         out_dir = Path(req["out_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)

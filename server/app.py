@@ -31,8 +31,8 @@ from fastapi.staticfiles import StaticFiles
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from mosstrainer import captioner  # noqa: E402
-from mosstrainer.edits import (EDITS_FILE, dataset_path, edit_row_problem, is_edit_dataset,  # noqa: E402
-                               read_edit_rows, write_edit_rows)
+from mosstrainer.edits import (EDITS_FILE, caption_file, dataset_path, edit_row_problem,  # noqa: E402
+                               is_edit_dataset, read_edit_rows, write_edit_rows)
 from mosstrainer.config import (DEFAULTS, FAMILY_TARGETS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE,  # noqa: E402
                                 validate)
 
@@ -485,6 +485,51 @@ class CaptionManager:
 captions = CaptionManager()
 
 
+class AutomaskManager:
+    """Runs mosstrainer.automask for a dataset in a subprocess and follows its JSON progress lines."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.runs: dict[str, dict] = {}
+
+    def start(self, dataset: str, folder: Path, keep: str, remove: str, overwrite: bool):
+        with self.lock:
+            st = self.runs.get(dataset)
+            if st and st["proc"].poll() is None:
+                raise HTTPException(409, "Masks are already being made for this dataset")
+            log = open(WORKSPACE / "cache" / f"automask-{dataset}.log", "w")
+            cmd = [sys.executable, "-m", "mosstrainer.automask", "--dataset", str(folder), "--keep", keep,
+                   "--remove", remove] + (["--overwrite"] if overwrite else [])
+            proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=log, text=True,
+                                    env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
+            st = {"proc": proc, "state": "running", "done": 0, "total": None, "message": "Starting", "keep": keep}
+            self.runs[dataset] = st
+        threading.Thread(target=self._read, args=(dataset, st), daemon=True).start()
+
+    def _read(self, dataset, st):
+        for line in st["proc"].stdout:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            with self.lock:
+                st.update(done=ev.get("done", st["done"]), total=ev.get("total", st["total"]),
+                          message=ev.get("message") or ev.get("file", ""))
+        code = st["proc"].wait()
+        with self.lock:
+            st["state"] = "done" if code == 0 else "error"
+            if code:
+                st["message"] = _tail_line(WORKSPACE / "cache" / f"automask-{dataset}.log") or f"exit code {code}"
+
+    def status(self, dataset: str) -> dict:
+        with self.lock:
+            st = self.runs.get(dataset)
+            return {k: v for k, v in st.items() if k != "proc"} if st else {"state": "idle"}
+
+
+automasks = AutomaskManager()
+
+
 # --------------------------------------------------------------------------- system
 
 @app.get("/api/info")
@@ -609,8 +654,16 @@ def gpu():
 
 # --------------------------------------------------------------------------- datasets
 
+MASK_SUFFIX = "-masklabel"  # photo.jpg -> photo-masklabel.png (same rule as mosstrainer.data)
+
+
 def dataset_images(folder: Path):
-    return sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith("."))
+    return sorted(p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith(".")
+                  and not p.stem.endswith(MASK_SUFFIX))
+
+
+def image_mask(img: Path) -> Path:
+    return img.with_name(img.stem + MASK_SUFFIX + ".png")
 
 
 def edit_rows_or_400(folder: Path) -> list[dict]:
@@ -672,15 +725,22 @@ def get_dataset(name: str):
         pairs = []
         for i, row in enumerate(edit_rows_or_400(path)):
             ins = row.get("instruction", "")
+            ins = ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False, indent=2)
+            cap = caption_file(path, row)  # a .txt / .json next to the target wins when it isn't empty
+            text = cap.read_text(encoding="utf-8").strip() if cap else ""
             pairs.append({"i": i, "sources": row.get("sources") or [], "target": row.get("target"),
-                          "instruction": ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False, indent=2),
+                          "instruction": text or ins,
+                          "caption_file": cap.relative_to(path.resolve()).as_posix() if text else None,
                           "problem": edit_row_problem(path, row)})
         return {"name": name, "type": "edit", "pairs": pairs}
     items = []
     for p in dataset_images(path):
         txt = p.with_suffix(".txt")
+        mask = image_mask(p)
         items.append({"file": p.name, "caption": txt.read_text(encoding="utf-8") if txt.exists() else "",
-                      "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)})
+                      "size": p.stat().st_size, "mtime": int(p.stat().st_mtime),
+                      "mask": mask.name if mask.exists() else None,
+                      "mask_mtime": int(mask.stat().st_mtime) if mask.exists() else 0})
     return {"name": name, "type": "images", "items": items}
 
 
@@ -724,7 +784,8 @@ def import_edit_zip(folder: Path, z: zipfile.ZipFile, jsonl: str) -> dict:
         if info.is_dir() or not info.filename.startswith(root) or "__MACOSX" in info.filename:
             continue
         parts = _rel_parts(info.filename[len(root):])
-        if parts and Path(parts[-1]).suffix in IMAGE_EXTS:
+        if parts and (Path(parts[-1]).suffix in IMAGE_EXTS or Path(parts[-1]).suffix in (".txt", ".json")) \
+                and parts[-1] != EDITS_FILE:  # images, and caption files next to the targets
             target = folder.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(z.read(info))
@@ -761,8 +822,27 @@ async def upload(name: str, files: list[UploadFile] = File(...)):
                 write_edit_rows(folder, (read_edit_rows(folder) if is_edit_dataset(folder) else []) + rows)
                 out["pairs"] += len(rows)
         return out
-    if edit:
-        raise HTTPException(400, f"This is an edit-pair dataset: use Add pair, or upload a .zip with {EDITS_FILE}")
+    if edit:  # caption files for the targets, matched by name; anything else belongs in a pair
+        targets = {}
+        for row in edit_rows_or_400(folder):
+            path = dataset_path(folder, row.get("target"))
+            if path is not None:
+                targets.setdefault(path.stem.lower(), path)
+        captions, unmatched = 0, []
+        for fn, d in datas:
+            name_ = Path(fn).name
+            if Path(name_).suffix.lower() not in (".txt", ".json"):
+                raise HTTPException(400, "This is an edit-pair dataset: use Add pair, upload a .zip with "
+                                         f"{EDITS_FILE}, or .txt captions named like the targets")
+            target = targets.get(Path(_clean_name(name_)).stem.lower()) or targets.get(Path(name_).stem.lower())
+            if target is None:
+                unmatched.append(name_)
+                continue
+            target.with_suffix(Path(name_).suffix.lower()).write_bytes(d)
+            captions += 1
+        if unmatched and not captions:
+            raise HTTPException(400, f"No target image is named like {', '.join(unmatched[:5])}")
+        return {"images": 0, "captions": captions, "pairs": 0, "unmatched": unmatched}
     added, captions = 0, 0
 
     def store(filename: str, data: bytes):
@@ -771,7 +851,9 @@ async def upload(name: str, files: list[UploadFile] = File(...)):
         if filename.startswith("."):
             return
         ext = Path(filename).suffix.lower()
-        if ext in IMAGE_EXTS:
+        if ext in IMAGE_EXTS and Path(filename).stem.endswith(MASK_SUFFIX):  # a mask: keep its name, replace
+            (folder / _clean_name(Path(filename).stem + ".png")).write_bytes(data)
+        elif ext in IMAGE_EXTS:
             _unique(folder, filename).write_bytes(data)
             added += 1
         elif ext == ".txt":
@@ -879,7 +961,33 @@ def delete_item(name: str, filename: str):
     img = safe_file(folder, filename)
     img.unlink(missing_ok=True)
     img.with_suffix(".txt").unlink(missing_ok=True)
+    image_mask(img).unlink(missing_ok=True)
     return {"ok": True}
+
+
+@app.delete("/api/datasets/{name}/mask/{filename}")
+def delete_mask(name: str, filename: str):
+    image_mask(safe_file(DATASETS / safe_name(name), filename)).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/api/datasets/{name}/automask")
+async def automask(name: str, request: Request):
+    """Masks from words with CLIPSeg for every image (without a mask, unless overwrite)."""
+    folder = DATASETS / safe_name(name)
+    if not folder.is_dir() or is_edit_dataset(folder):
+        raise HTTPException(400, "Masks are for image datasets")
+    body = await request.json()
+    keep = str(body.get("keep", "")).strip()
+    if not keep:
+        raise HTTPException(400, "Say what to keep, e.g. person")
+    automasks.start(name, folder, keep, str(body.get("remove", "")), bool(body.get("overwrite")))
+    return automasks.status(name)
+
+
+@app.get("/api/datasets/{name}/automask")
+def automask_status(name: str):
+    return automasks.status(safe_name(name))
 
 
 @app.post("/api/datasets/{name}/pairs")
@@ -933,8 +1041,13 @@ async def update_pair(name: str, i: int, request: Request):
     folder = DATASETS / safe_name(name)
     body = await request.json()
     rows = edit_rows_or_400(folder)
-    pair_or_409(rows, i, body.get("target"))["instruction"] = parse_instruction(body.get("instruction", ""))
-    write_edit_rows(folder, rows)
+    row = pair_or_409(rows, i, body.get("target"))
+    cap = caption_file(folder, row)
+    if cap is not None and cap.read_text(encoding="utf-8").strip():  # the instruction lives in that file
+        cap.write_text(str(body.get("instruction", "")).strip(), encoding="utf-8")
+    else:
+        row["instruction"] = parse_instruction(body.get("instruction", ""))
+        write_edit_rows(folder, rows)
     return {"ok": True, "problem": edit_row_problem(folder, rows[i])}
 
 
@@ -946,6 +1059,8 @@ def delete_pair(name: str, i: int, target: str):
     del rows[i]
     write_edit_rows(folder, rows)
     used = {r for other in rows for r in (other.get("sources") or []) + [other.get("target")]}
+    if row.get("target") not in used and (cap := caption_file(folder, row)) is not None:
+        cap.unlink()
     for rel in set((row.get("sources") or []) + [row.get("target")]) - used:  # images no other pair uses
         path = dataset_path(folder, rel)
         if path is not None and path.is_file():
@@ -1003,7 +1118,7 @@ async def create_job(request: Request):
     if not (DATASETS / cfg["dataset"]).is_dir():
         raise HTTPException(400, f"Dataset '{cfg['dataset']}' does not exist")
     if is_edit_dataset(DATASETS / cfg["dataset"]) and not MODEL_SPECS[cfg["model"]].get("edit"):
-        raise HTTPException(400, f"'{cfg['dataset']}' holds edit pairs, which train on Fibo 2.0 Dev")
+        raise HTTPException(400, f"'{cfg['dataset']}' holds edit pairs, which train on Fibo 2.0 Dev or Krea 2 / Kroma")
     job_dir = JOBS / cfg["name"]
     if job_dir.exists():
         if not overwrite:
@@ -1033,7 +1148,8 @@ def get_job(name: str):
     d = job_dir_or_404(name)
     ckpts = []
     for p in sorted((d / "checkpoints").glob("*.safetensors")) if (d / "checkpoints").exists() else []:
-        ckpts.append({"file": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime})
+        ckpts.append({"file": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime,
+                      "comfyui": (d / "checkpoints" / "comfyui" / p.name).exists()})
     return {"name": name, "config": read_json(d / "config.json", {}), "status": manager.status(name),
             "checkpoints": ckpts, "samples": read_json(d / "samples" / "index.json", []),
             "resumable": (d / "checkpoints" / "training_state.pt").exists()}
@@ -1117,9 +1233,9 @@ def job_sample(name: str, filename: str):
 
 
 @app.get("/api/jobs/{name}/checkpoint/{filename}")
-def job_checkpoint(name: str, filename: str):
+def job_checkpoint(name: str, filename: str, variant: str = ""):
     d = job_dir_or_404(name)
-    path = safe_file(d / "checkpoints", filename)
+    path = safe_file(d / "checkpoints" / ("comfyui" if variant == "comfyui" else ""), filename)
     if not path.exists() or path.suffix != ".safetensors":
         raise HTTPException(404)
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")

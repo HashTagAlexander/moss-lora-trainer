@@ -326,3 +326,10 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .pair-side .meta { display: flex; justify-content: space-between; align-items: center; padding: 4px 6px 4px 10px; font-size: 11px; color: var(--faint); border-top: 1px solid var(--border); }
 .pair-side .meta .saved { color: var(--green); }
 @media (max-width: 860px) { .pair { grid-template-columns: 1fr; } .pair-side { border-left: 0; border-top: 1px solid var(--border); } }
+
+/* ---------- training masks ---------- */
+.item .mask-ov { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; mix-blend-mode: multiply; opacity: 0; pointer-events: none; transition: opacity .15s; }
+.items.show-masks .item .mask-ov { opacity: .85; }
+.item .mask-badge { position: absolute; left: 8px; bottom: 8px; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: rgba(10, 12, 16, .8); color: var(--accent-2); }
+.item .mask-del { position: absolute; left: 8px; top: 8px; opacity: 0; transition: opacity .15s; background: rgba(10, 12, 16, .8); padding: 3px 7px; }
+.items.show-masks .item:hover .mask-del { opacity: 1; }

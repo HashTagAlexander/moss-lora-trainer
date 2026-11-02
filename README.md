@@ -31,6 +31,17 @@ Qwen-Image VAE (both byte-identical to what Krea 2 ships). Kroma LoRAs are saved
 ComfyUI. Sampling CFG uses the standard convention (1 = off), so Krea's "guidance 4.5" is CFG 5.5 here. Shift 0
 means the resolution-aware default.
 
+**Krea 2 / Kroma edit LoRAs**: Krea 2 isn't an edit model, but a LoRA can teach it to edit, the way
+[ai-toolkit](https://github.com/ostris/ai-toolkit) does it (the same contract ComfyUI's core Krea 2 nodes run). Use an
+**Edit pairs** dataset (same layout as Fibo's below) with a trainable Krea 2 model (`kroma-v0.3-teacher`,
+`kroma-v0.3-base` or `krea2-raw`). Each source image is shown twice: Qwen3-VL sees it (at most 384×384) as
+`Picture N:` before the instruction, and its latents (only scaled down, to at most 1 MP) join the transformer's
+sequence after the target, each on its own RoPE frame and modulated as clean (noise level 0) while the target is
+noisy. Only the target is predicted. Dropped captions and the negative prompt are encoded with the sources too.
+Context dropout (Bria's idea, default 0.2) also applies; set it to 0 to match ai-toolkit exactly. Edit with the
+LoRA in the Generate tab by adding a source image (Turbo models run the same edit path), or in ComfyUI with its
+core Krea 2 reference-image nodes.
+
 ### Fibo 2.0 (Bria)
 
 [Fibo 2.0](https://huggingface.co/briaai/Fibo-2.0-dev) is gated: accept its license on Hugging Face (Dev and Edit
@@ -49,13 +60,17 @@ from the same page, or let them download on first use. Everything runs on diffus
   caption, timesteps are Bria's resolution-shifted logit-normal with 10% uniform, and the transformer runs in plain
   bf16. By default the LoRA covers every Linear layer (attention, feed-forward, text perceiver, modulation), as Bria's
   recipe does. LoRAs are saved in diffusers format and load with
-  `pipe.transformer.load_lora_adapter(folder, weight_name="name.safetensors")`.
+  `pipe.transformer.load_lora_adapter(folder, weight_name="name.safetensors")`. Each checkpoint also gets a
+  **ComfyUI** copy (`checkpoints/comfyui/`, a ComfyUI button on the Checkpoints tab): ComfyUI runs Comfy-Org's
+  repacked Fibo 2.0, whose q/k/v, k/v and w1/w3 are fused (w13 zero-padded to 9728), so the LoRA is re-fused to that
+  layout exactly (down projections stacked, up projections block-diagonal), with Comfy-Org's own key names.
 - **Generate tab**: text-to-image, or upload a **source image** to edit it (the prompt is then the edit instruction,
   or a VGL caption of the result with an `edit_instruction` key). Edit Turbo does edits in 4 steps without CFG.
   The default negative for Dev is the one from Bria's model card.
 - **Edit LoRAs**: create a dataset of type **Edit pairs** (or drop in a zip in Bria's layout: `edits.jsonl` plus
   its images). Each pair is 1–4 source images, the target, and an instruction: a plain edit instruction, or a VGL
-  caption of the result with an `edit_instruction` key (train in the form you'll prompt with). Training follows Bria's
+  caption of the result with an `edit_instruction` key (train in the form you'll prompt with). A `.txt` (or `.json`)
+  next to the target image is its instruction and wins over the one in `edits.jsonl`. Training follows Bria's
   edit recipe: the prompt is encoded together with the sources, their latents condition the transformer, 20% context
   dropout trains without them, and pairs train one at a time (batch size becomes gradient accumulation). Samples show
   the sources next to the result; by default they're the first pairs' own instructions, or set **Sample source
@@ -142,6 +157,16 @@ After a stop/start, run `bash /workspace/loratrainer/setup.sh` again (quick: eve
 4. Download LoRAs from the **Checkpoints** tab.
 
 Starting points: rank 32 / alpha 32, AdamW at 1e-4, 1500–3000 steps for 20–50 images, 1024 resolution.
+**LoKr** (Network → Adapter): LyCORIS' Kronecker adapter, `ΔW = kron(w1, w2)` with w1 about factor × factor and
+w2 the rest. Saved as `lokr_w1` / `lokr_w2` (ComfyUI and LyCORIS load it for MOSS-Image and Krea 2; Fibo 2.0 LoKrs
+work in the Generate tab, since ComfyUI's fused Fibo layers can't take a Kronecker factor per projection).
+
+**Masked training** (Dataset → Masked training): a black-and-white `<name>-masklabel.png` beside an image says which
+part counts. The loss is weighted by it on the latent grid, the rest counting at the mask floor (0.1), normalised so
+every picture counts the same. **Make masks** in the dataset viewer writes them from words ("person", "woman with red
+hair", "face, hair") with CLIPSeg; its masks are soft and coarse, which suits loss weighting. Drop in your own for
+precise ones. Edit pairs don't use masks.
+
 **Automagic v3** (from [ai-toolkit](https://github.com/ostris/ai-toolkit), MIT) adapts its own learning rate: the
 value you set is only where it starts, and the LR schedule and warmup are ignored. **Timestep bias** (Balanced / High
 noise / Low noise) skews any timestep type toward noisier steps (composition, likeness) or cleaner ones (style,

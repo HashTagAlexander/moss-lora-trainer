@@ -24,13 +24,13 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from . import lora as lora_lib
 from .config import DEFAULTS, FIBO_NEGATIVE_T2I, defaults_for, parse_layers, validate
 from .data import (BucketSampler, EditItem, TextCache, apply_trigger, build_edit_items, build_items, cache_edit_embeds,
-                   cache_edit_latents, cache_latents, dataset_path, edit_cache_paths, edit_prompt, edit_row_problem,
-                   is_edit_dataset, load_edit, load_latent, load_rgb, read_edit_rows)
+                   cache_edit_latents, cache_latents, dataset_path, edit_cache_paths, edit_row_problem, pair_prompt,
+                   is_edit_dataset, load_edit, load_latent, load_mask, load_rgb, read_edit_rows)
 from .backends import Backend, get_backend, sigma_shift_flux
 from .model import pad_embeds
 
@@ -171,7 +171,7 @@ def edit_samples(cfg: dict, dataset_dir: Path, log) -> list[EditItem]:
     rows = [r for r in read_edit_rows(dataset_dir) if not edit_row_problem(dataset_dir, r)]
     prompts = sc["prompts"]
     if not prompts or prompts in (DEFAULTS["sample"]["prompts"], defaults_for(cfg["model"])["sample"]["prompts"]):
-        prompts = [edit_prompt(r["instruction"]) for r in rows[:2]]
+        prompts = [pair_prompt(dataset_dir, r) for r in rows[:2]]
         log("samples: the first pairs' instructions on their own sources (set sample prompts and sources to choose)")
     lines = [[rel.strip() for rel in line.split(",") if rel.strip()] for line in sc["sources"]]
     missing = [rel for line in lines for rel in line
@@ -221,7 +221,7 @@ def run(job: Job):
     samples: list[EditItem] = []
     if edit:
         if not backend.supports_edit:
-            raise ValueError(f"Dataset '{cfg['dataset']}' holds edit pairs, which need a Fibo 2.0 model.")
+            raise ValueError(f"Dataset '{cfg['dataset']}' holds edit pairs, which need a Fibo 2.0 or Krea 2 model.")
         items = build_edit_items(dataset_dir, cfg["data"]["resolutions"], cfg["trigger_word"], job.log)
         job.log(f"dataset: {len(items)} edit pairs from {dataset_dir} (edit LoRA)")
         if cfg["data"]["flip"]:
@@ -229,9 +229,11 @@ def run(job: Job):
         if t["batch_size"] > 1:
             job.log(f"note: edit pairs train one at a time; batch size {t['batch_size']} becomes gradient accumulation")
         samples = edit_samples(cfg, dataset_dir, job.log) if sc["every"] > 0 else []
-        edit_cache_paths(items + samples, cache_root / "edit", backend.text_cache_id)
+        edit_cache_paths(items + samples, cache_root / "edit", backend.text_cache_id,
+                         sc["negative_prompt"] if backend.edit_null_with_images else "")
     else:
-        items = build_items(dataset_dir, cfg["data"]["resolutions"], cfg["trigger_word"], cfg["data"]["flip"], job.log)
+        items = build_items(dataset_dir, cfg["data"]["resolutions"], cfg["trigger_word"], cfg["data"]["flip"], job.log,
+                            masks=cfg["data"]["masks"])
         job.log(f"dataset: {len(items)} training entries from {dataset_dir}")
 
     sample_prompts = [] if edit else [apply_trigger(p, cfg["trigger_word"]) for p in sc["prompts"]]
@@ -251,7 +253,8 @@ def run(job: Job):
         enc = backend.load_text_encoder(device)
         text_cache.fill(enc, missing, job.progress("caching_text", "Encoding captions"))
         if edit_todo:
-            cache_edit_embeds(items + samples, backend, enc, job.progress("caching_text", "Encoding edit prompts"))
+            cache_edit_embeds(items + samples, backend, enc, job.progress("caching_text", "Encoding edit prompts"),
+                              negative=sc["negative_prompt"])
         enc.unload()
         del enc
     job.check_stop()
@@ -278,7 +281,8 @@ def run(job: Job):
     transformer = backend.load_transformer(device)
     net = cfg["network"]
     modules = lora_lib.inject(transformer, net["rank"], net["alpha"], net["targets"], net["dropout"],
-                              parse_layers(net["layers"]), backend.lora_targets, backend.lora_layer_re)
+                              parse_layers(net["layers"]), backend.lora_targets, backend.lora_layer_re,
+                              kind=net["type"], factor=net["lokr_factor"])
     backend.set_gradient_checkpointing(transformer, t["gradient_checkpointing"])
     params = list(lora_lib.parameters(modules))
     job.log(f"LoRA: {len(modules)} modules, {sum(p.numel() for p in params) / 1e6:.2f}M trainable params")
@@ -293,14 +297,14 @@ def run(job: Job):
     state_path = job.ckpt_dir / "training_state.pt"
     if state_path.exists():
         st = torch.load(state_path, map_location="cpu", weights_only=False)
-        mismatch = [n for n, m in modules.items()
-                    if st["lora"].get(n + ".A") is None or st["lora"][n + ".A"].shape != m.lora_A.weight.shape]
+        mismatch = [f"{n}.{k}" for n, m in modules.items() for k, p in m.adapter_params().items()
+                    if st["lora"].get(f"{n}.{k}") is None or st["lora"][f"{n}.{k}"].shape != p.shape]
         if mismatch:
             raise RuntimeError("Saved training state doesn't match the current network settings "
-                               "(rank/targets/blocks changed). Reset the job to start fresh.")
+                               "(type/rank/factor/targets/blocks changed). Reset the job to start fresh.")
         for name, m in modules.items():
-            m.lora_A.weight.data.copy_(st["lora"][name + ".A"])
-            m.lora_B.weight.data.copy_(st["lora"][name + ".B"])
+            for k, p in m.adapter_params().items():
+                p.data.copy_(st["lora"][f"{name}.{k}"])
         opt.load_state_dict(st["optimizer"])
         lr_sched.load_state_dict(st["scheduler"])
         step = st["step"]
@@ -317,7 +321,8 @@ def run(job: Job):
         for i, s in enumerate(samples):  # edits: the source next to its edited result
             job.set(state="sampling", message=f"Sample {i + 1}/{len(samples)}")
             d = load_edit(s)
-            img = backend.sample(transformer, vae, d["embeds"], text_cache.get(neg_prompt), width=s.bucket[0],
+            neg = d["neg_embeds"] if d["neg_embeds"] is not None else text_cache.get(neg_prompt)
+            img = backend.sample(transformer, vae, d["embeds"], neg, width=s.bucket[0],
                                  height=s.bucket[1], steps=sc["steps"], cfg=sc["cfg"], seed=sc["seed"] + i,
                                  shift=sc["shift"], skip_layer=sc["uncond_skip_layer"], device=device,
                                  context=[c[None].to(device) for c in d["context"]])
@@ -346,11 +351,15 @@ def run(job: Job):
         meta = {"ss_base_model": cfg["model"], "ss_steps": str(at_step), "ss_trigger": cfg["trigger_word"],
                 "ss_network_rank": str(net["rank"]), "ss_network_alpha": str(net["alpha"]),
                 "moss_trainer_config": cfg}
-        lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype, backend.lora_format,
-                      backend.lora_arch)
+        sd = lora_lib.save(modules, job.ckpt_dir / f"{name}.safetensors", meta, save_dtype, backend.lora_format,
+                           backend.lora_arch)
+        comfy = backend.comfyui_lora(sd) if net["type"] == "lora" else None
+        if comfy is not None:  # the same LoRA in ComfyUI's layout of this model, beside it
+            (job.ckpt_dir / "comfyui").mkdir(exist_ok=True)
+            save_file(comfy, str(job.ckpt_dir / "comfyui" / f"{name}.safetensors"),
+                      metadata={"format": "pt", "modelspec.architecture": backend.lora_arch, "ss_steps": str(at_step)})
         torch.save({
-            "lora": {**{k + ".A": m.lora_A.weight.detach().cpu() for k, m in modules.items()},
-                     **{k + ".B": m.lora_B.weight.detach().cpu() for k, m in modules.items()}},
+            "lora": {f"{n}.{k}": p.detach().cpu() for n, m in modules.items() for k, p in m.adapter_params().items()},
             "optimizer": opt.state_dict(), "scheduler": lr_sched.state_dict(), "step": at_step,
         }, state_path.with_suffix(".tmp"))
         os.replace(state_path.with_suffix(".tmp"), state_path)
@@ -359,6 +368,7 @@ def run(job: Job):
             ckpts = sorted(job.ckpt_dir.glob(f"{cfg['name']}_*.safetensors"))
             for old in ckpts[:-keep]:
                 old.unlink(missing_ok=True)
+                (job.ckpt_dir / "comfyui" / old.name).unlink(missing_ok=True)
         job.log(f"saved {name}.safetensors")
 
     if step == 0 and sc["sample_first"] and sc["every"] > 0:
@@ -367,6 +377,7 @@ def run(job: Job):
     sampler = BucketSampler(items, 1 if edit else t["batch_size"], cfg["data"]["repeats"], seed=t["seed"] + step)
     accum = t["grad_accum"] * (t["batch_size"] if edit else 1)
     edit_mem: dict[str, dict] = {}
+    mask_mem: dict[tuple, torch.Tensor] = {}
     latent_mem: dict[str, torch.Tensor] = {}
     metrics = open(job.dir / "metrics.jsonl", "a")
     times = deque(maxlen=20)
@@ -379,12 +390,15 @@ def run(job: Job):
         key = str(it.lat_path)
         if key not in edit_mem:  # target and source latents are small; the prompt embeddings are read each time
             d = load_edit(it)
-            edit_mem[key] = {"x0": d["x0"], "context": d["context"]}
+            edit_mem[key] = {"x0": d["x0"], "context": d["context"], "null": d["null_embeds"]}
         d = edit_mem[key]
         x0 = d["x0"][None].to(device, torch.float32)
         noise = torch.randn_like(x0)
         sig = sample_sigmas(1, t, device, backend.tokens(x0))
-        emb = text_cache.get(backend.empty_prompt) if random.random() < drop else load_file(str(it.emb_path))["embeds"]
+        if random.random() < drop:  # the empty caption (with the sources, for models that see them there)
+            emb = d["null"] if d["null"] is not None else text_cache.get(backend.empty_prompt)
+        else:
+            emb = load_file(str(it.emb_path))["embeds"]
         context = None if random.random() < context_drop else [c[None].to(device) for c in d["context"]]
         embeds, mask = pad_embeds([emb], device)
         noisy = (1 - sig.view(-1, 1, 1, 1)) * x0 + sig.view(-1, 1, 1, 1) * noise
@@ -422,7 +436,16 @@ def run(job: Job):
             noisy = (1 - s) * x0 + s * noise
             with autocast:
                 pred = backend.predict(transformer, noisy, sig, embeds, mask)
-            loss = F.mse_loss(pred.float(), noise - x0) / accum
+            if any(it.mask for it in batch):  # masked training: per-pixel weights on the latent grid
+                for it in batch:
+                    mkey = (str(it.mask), it.bucket, it.flip, tuple(x0.shape[-2:]))
+                    if it.mask and mkey not in mask_mem:
+                        mask_mem[mkey] = load_mask(it, tuple(x0.shape[-2:]), cfg["data"]["mask_floor"])
+                w = torch.stack([mask_mem[(str(it.mask), it.bucket, it.flip, tuple(x0.shape[-2:]))] if it.mask
+                                 else torch.ones(x0.shape[-2:]) for it in batch]).to(device)[:, None]
+                loss = ((pred.float() - (noise - x0)) ** 2 * w).mean() / accum
+            else:
+                loss = F.mse_loss(pred.float(), noise - x0) / accum
             loss.backward()
             loss_total += loss.item()
         if not math.isfinite(loss_total):

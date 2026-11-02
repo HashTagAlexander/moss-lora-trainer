@@ -87,6 +87,11 @@ MODEL_SPECS = {
         "gated": True, "edit": True, "defaults": _FIBO_TURBO_DEFAULTS},
 }
 
+# Krea 2 / Kroma train and run edit LoRAs too (ostris' reference-image contract, see backends.Krea2Backend).
+for _spec in MODEL_SPECS.values():
+    if _spec["family"] == "krea2":
+        _spec["edit"] = True
+
 # Extra models (local paths etc.) can be registered from a JSON file, e.g. for tests.
 if os.environ.get("MOSS_EXTRA_MODELS"):
     MODEL_SPECS.update(json.loads(open(os.environ["MOSS_EXTRA_MODELS"]).read()))
@@ -106,6 +111,8 @@ DEFAULTS = {
     "dataset": "",
     "trigger_word": "",
     "network": {
+        "type": "lora",                # lora | lokr
+        "lokr_factor": 8,              # LoKr: w1 is about factor x factor, w2 the rest (full)
         "rank": 32,
         "alpha": 32,
         "dropout": 0.0,
@@ -118,6 +125,8 @@ DEFAULTS = {
         "repeats": 1,
         "caption_dropout": 0.05,
         "context_dropout": 0.2,        # edit pairs: chance of training without the source latents (Bria's default)
+        "masks": False,                # weight the loss by <image>-masklabel.png masks
+        "mask_floor": 0.1,             # weight of the masked-out area (0 = ignore it entirely)
     },
     "train": {
         "steps": 2000,
@@ -224,6 +233,13 @@ def validate(cfg: dict) -> dict:
     n["rank"], n["alpha"] = int(n["rank"]), float(n["alpha"])
     if not 1 <= n["rank"] <= 512:
         raise ValueError("Rank must be between 1 and 512.")
+    if n["type"] not in ("lora", "lokr"):
+        raise ValueError("Network type must be lora or lokr.")
+    n["lokr_factor"] = int(n["lokr_factor"])
+    if n["lokr_factor"] == 0 or n["lokr_factor"] < -1:
+        raise ValueError("LoKr factor must be a positive number, or -1 for automatic.")
+    cfg["data"]["masks"] = bool(cfg["data"]["masks"])
+    cfg["data"]["mask_floor"] = min(1.0, max(0.0, float(cfg["data"]["mask_floor"])))
     if not n["targets"]:
         raise ValueError("Select at least one LoRA target.")
     allowed = FAMILY_TARGETS.get(spec["family"], {})

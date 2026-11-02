@@ -40,7 +40,8 @@ class Backend:
     text_cache_id = ""                 # part of the text-cache key
     empty_prompt = ""                  # what caption dropout and an empty negative prompt encode (cache key)
     use_autocast = True                # run the transformer under bf16 autocast
-    supports_edit = False              # can condition on source images (Generate tab)
+    supports_edit = False              # can condition on source images (Generate tab, edit LoRAs)
+    edit_null_with_images = False      # edits: dropped captions and negatives are encoded with the sources
 
     def __init__(self, model_id: str):
         self.model_id = model_id
@@ -61,6 +62,10 @@ class Backend:
     def lora_name_map(self, name: str) -> str:
         """Map module names found in third-party LoRA files onto this model's module names."""
         return name
+
+    def comfyui_lora(self, sd: dict) -> dict | None:
+        """The saved LoRA in ComfyUI's layout, when that differs from the file we write (else None)."""
+        return None
 
 
 # --------------------------------------------------------------------------- MOSS-Image
@@ -146,15 +151,19 @@ class Krea2TextEncoder:
 
     def __init__(self, source, device, dtype=torch.bfloat16):
         from transformers import AutoTokenizer, Qwen3VLModel
+        self.source = source
         self.tokenizer = AutoTokenizer.from_pretrained(source)
         self.tokenizer.padding_side = "right"  # [prefix | prompt | PAD | suffix], as in the reference
         self.model = Qwen3VLModel.from_pretrained(source, dtype=dtype).to(device).eval()
         self.model.requires_grad_(False)
         self.device = torch.device(device)
         self.taps = KREA2_TAPS
+        self._processor = None
 
     @torch.no_grad()
-    def encode(self, prompt: str) -> torch.Tensor:
+    def encode(self, prompt: str, images=None) -> torch.Tensor:
+        if images:
+            return self._encode_with_images(prompt, images)
         tok = self.tokenizer
         text = tok([KREA2_PREFIX + prompt], truncation=True, padding="max_length",
                    max_length=self.max_len + self.start_idx - self.num_suffix, return_tensors="pt")
@@ -165,6 +174,30 @@ class Krea2TextEncoder:
         out = self.model(input_ids=ids, attention_mask=mask, position_ids=position_ids, output_hidden_states=True)
         hs = torch.stack([out.hidden_states[i] for i in self.taps], dim=2)[0, self.start_idx:]
         return hs[mask[0, self.start_idx:]].to(torch.bfloat16).cpu()
+
+    @torch.no_grad()
+    def _encode_with_images(self, prompt: str, images) -> torch.Tensor:
+        """ostris' Krea 2 edit conditioning (ai-toolkit krea2 `encode_krea_prompt`, the ComfyUI
+        TextEncodeQwenImageEditPlus layout): "Picture N: <vision>" per image ahead of the prompt in the user turn, at
+        natural length; the 34 system-prefix tokens are sliced off as usual."""
+        if self._processor is None:
+            from transformers import AutoProcessor
+            self._processor = AutoProcessor.from_pretrained(self.source)
+        proc = self._processor
+        pics = "".join(f"Picture {i + 1}: <|vision_start|><|image_pad|><|vision_end|>" for i in range(len(images)))
+        inputs = proc(text=[KREA2_PREFIX + pics + prompt], images=list(images), do_rescale=False,
+                      return_tensors="pt").to(self.device)  # images: [3, h, w] floats in [0, 1]
+        suffix = proc(text=[KREA2_SUFFIX], return_tensors="pt").to(self.device)
+        extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+        extra = {k: v.to(self.model.dtype) if torch.is_tensor(v) and v.is_floating_point() else v for k, v in extra.items()}
+        if "mm_token_type_ids" in extra:  # the appended suffix is plain text
+            extra["mm_token_type_ids"] = torch.cat(
+                [extra["mm_token_type_ids"], torch.zeros_like(suffix["input_ids"], dtype=extra["mm_token_type_ids"].dtype)], 1)
+        out = self.model(input_ids=torch.cat([inputs["input_ids"], suffix["input_ids"]], 1),
+                         attention_mask=torch.cat([inputs["attention_mask"], suffix["attention_mask"]], 1).bool(),
+                         output_hidden_states=True, **extra)
+        hs = torch.stack([out.hidden_states[i] for i in self.taps], dim=2)[0, self.start_idx:]
+        return hs.to(torch.bfloat16).cpu()
 
     def unload(self):
         self.model = None
@@ -193,6 +226,13 @@ class Krea2Backend(Backend):
     text_cache_id = "krea2-qwen3vl4b-v1"
     patch = 2
     vae_scale = 8
+    # Edit LoRAs follow ostris' Krea 2 edit contract (ai-toolkit `arch: krea2`, `edit: true`), which ComfyUI core runs:
+    # each source goes to Qwen3-VL with the prompt and, VAE-encoded, after the target tokens on RoPE frame i+1,
+    # modulated at t=0; captions dropped and negatives are encoded with the sources too.
+    supports_edit = True
+    edit_null_with_images = True
+    REF_MAX_PIXELS = 1024 * 1024   # sources are only scaled down, to this area (ai-toolkit's default)
+    VLM_MAX_PIXELS = 384 * 384     # what Qwen3-VL sees of each source
 
     # ---- downloads
     def _transformer_path(self):
@@ -323,18 +363,104 @@ class Krea2Backend(Backend):
         c = cpp // (p * p)
         return x.view(b, h // p, w // p, c, p, p).permute(0, 3, 1, 4, 2, 5).reshape(b, c, h, w)
 
-    def predict(self, model, x, sigma, embeds, mask):
+    @staticmethod
+    def _grid_ids(gh, gw, frame, device):
+        ids = torch.zeros(gh * gw, 3, device=device)
+        ids[:, 0] = frame
+        ids[:, 1] = torch.arange(gh, device=device).repeat_interleave(gw).float()
+        ids[:, 2] = torch.arange(gw, device=device).repeat(gh).float()
+        return ids
+
+    def predict(self, model, x, sigma, embeds, mask, context=None):
         _, _, h, w = x.shape
         gh, gw = h // self.patch, w // self.patch
         text_len = embeds.shape[1]
-        ids = torch.zeros(text_len + gh * gw, 3, device=x.device)
-        ids[text_len:, 1] = torch.arange(gh, device=x.device).repeat_interleave(gw).float()
-        ids[text_len:, 2] = torch.arange(gw, device=x.device).repeat(gh).float()
+        ids = torch.cat([torch.zeros(text_len, 3, device=x.device), self._grid_ids(gh, gw, 0, x.device)])
         dtype = torch.bfloat16 if x.device.type == "cuda" else next(model.parameters()).dtype
+        enc_mask = None if bool(mask.all()) else mask
+        if context:
+            return self._unpack(self._forward_refs(model, self._pack(x).to(dtype), embeds.to(dtype), sigma.to(dtype),
+                                                   ids, enc_mask, context, dtype).float(), h, w)
         out = model(hidden_states=self._pack(x).to(dtype), encoder_hidden_states=embeds.to(dtype),
-                    timestep=sigma.to(dtype), position_ids=ids,
-                    encoder_attention_mask=None if bool(mask.all()) else mask, return_dict=False)[0]
+                    timestep=sigma.to(dtype), position_ids=ids, encoder_attention_mask=enc_mask, return_dict=False)[0]
         return self._unpack(out.float(), h, w)
+
+    def _forward_refs(self, model, img, txt, timestep, ids, enc_mask, refs, dtype):
+        """Krea2Transformer2DModel.forward with reference tokens appended after the target: ref i on RoPE frame i+1
+        (own grid from 0) and modulated at t=0, text and target at the noisy t, the prediction covering the target
+        only (ostris' Krea 2 edit). The blocks take per-token modulation as is: theirs just broadcasts (B, 1, 6H)."""
+        import torch.nn.functional as F
+        b, n_img, _ = img.shape
+        ref_tok = [self._pack(r.to(img.device, dtype)) for r in refs]
+        ref_ids = [self._grid_ids(r.shape[-2] // self.patch, r.shape[-1] // self.patch, i + 1, img.device)
+                   for i, r in enumerate(refs)]
+        img = torch.cat([img] + [t.expand(b, -1, -1) for t in ref_tok], 1)
+        ids = torch.cat([ids] + ref_ids)
+        n_ref = img.shape[1] - n_img
+        temb = model.time_embed(timestep, dtype=dtype)
+        mod = model.time_mod_proj(F.gelu(temb, approximate="tanh"))
+        mod0 = model.time_mod_proj(F.gelu(model.time_embed(torch.zeros_like(timestep), dtype=dtype), approximate="tanh"))
+        text_len = txt.shape[1]
+        mods = torch.cat([mod.expand(b, text_len + n_img, -1), mod0.expand(b, n_ref, -1)], 1)
+        text_mask = attn_mask = None
+        if enc_mask is not None:
+            text_mask = enc_mask[:, None, None, :]
+            attn_mask = torch.cat([enc_mask, enc_mask.new_ones((b, img.shape[1]))], 1)[:, None, None, :]
+        txt = model.txt_in(model.text_fusion(txt, attention_mask=text_mask))
+        hidden = torch.cat([txt, model.img_in(img)], 1)
+        rope = model.rotary_emb(ids)
+        for block in model.transformer_blocks:
+            if torch.is_grad_enabled() and model.gradient_checkpointing:
+                hidden = model._gradient_checkpointing_func(block, hidden, mods, rope, attn_mask)
+            else:
+                hidden = block(hidden, mods, rope, attn_mask)
+        return model.final_layer(hidden[:, text_len:text_len + n_img], temb)
+
+    # ---- editing (edit LoRAs, Generate tab)
+    def edit_size(self, width, height, area):
+        """The result's size for a first source of this size: its aspect ratio at about `area` pixels."""
+        m = self.vae_scale * self.patch
+        w = max(m, round((area * width / height) ** 0.5 / m) * m)
+        return w, max(m, round(area / w / m) * m)
+
+    def edit_inputs(self, images, area):
+        """Sources as ai-toolkit's Krea 2 edit prepares them: each only scaled down, to REF_MAX_PIXELS, snapped to
+        multiples of 16 (bilinear), for the VAE; and a copy of at most VLM_MAX_PIXELS (bicubic, antialiased) for
+        Qwen3-VL, kept as a float tensor because its image processor resizes tensors and PIL images differently.
+        The result size follows the first source. Returns (VAE crops [1, 3, h, w] in [-1, 1], Qwen3-VL copies
+        [3, h, w] in [0, 1], width, height)."""
+        import torch.nn.functional as F
+        m = self.vae_scale * self.patch
+        crops, thumbs = [], []
+        for im in images:
+            src = torch.frombuffer(bytearray(im.tobytes()), dtype=torch.uint8).view(im.height, im.width, 3)
+            x = src = src.permute(2, 0, 1)[None].float() / 255
+            h, w = im.height, im.width
+            nh, nw = (h, w) if h * w <= self.REF_MAX_PIXELS else ((self.REF_MAX_PIXELS * h / w) ** 0.5,
+                                                                  (self.REF_MAX_PIXELS * w / h) ** 0.5)
+            nh, nw = max(m, int(round(nh / m)) * m), max(m, int(round(nw / m)) * m)
+            if (nh, nw) != (h, w):
+                x = F.interpolate(x, size=(nh, nw), mode="bilinear")
+            crops.append(x * 2 - 1)
+            s = min(1.0, (self.VLM_MAX_PIXELS / (h * w)) ** 0.5)
+            th, tw = max(round(h * s), 28), max(round(w * s), 28)
+            if (th, tw) != (h, w):
+                src = F.interpolate(src, size=(th, tw), mode="bicubic", antialias=True).clamp(0, 1)
+            thumbs.append(src[0])
+        width, height = self.edit_size(images[0].width, images[0].height, area)
+        return crops, thumbs, width, height
+
+    @staticmethod
+    def edit_target(image, width, height):
+        """The target scaled to cover the result size and centre-cropped: [1, 3, h, w] in [-1, 1]."""
+        from .data import _cover_crop
+        im = _cover_crop(image.convert("RGB"), (width, height), False)
+        x = torch.frombuffer(bytearray(im.tobytes()), dtype=torch.uint8).view(height, width, 3)
+        return x.permute(2, 0, 1)[None].float().div(127.5).sub(1.0)
+
+    def prepare_edit(self, vae, image, width, height):
+        crops, thumbs, width, height = self.edit_inputs([image], width * height)
+        return [self.encode_images(vae, c) for c in crops], thumbs, width, height
 
     @staticmethod
     def calculate_mu(seq_len, base_seq=256, max_seq=6400, base_shift=0.5, max_shift=1.15):
@@ -343,7 +469,7 @@ class Krea2Backend(Backend):
 
     @torch.no_grad()
     def sample(self, model, vae, pos, neg, *, width, height, steps, cfg, seed, shift, skip_layer, device,
-               progress=None, latents=None, output="pil"):
+               progress=None, latents=None, output="pil", context=None):
         import numpy as np
         from diffusers import FlowMatchEulerDiscreteScheduler
         from PIL import Image
@@ -365,9 +491,9 @@ class Krea2Backend(Backend):
         with _autocast(device):
             for i, t in enumerate(timesteps):
                 sig = (t / 1000).reshape(1).to(device)
-                pred = self.predict(model, latents, sig, p_emb, p_mask)
+                pred = self.predict(model, latents, sig, p_emb, p_mask, context)
                 if cfg != 1.0:
-                    uncond = self.predict(model, latents, sig, n_emb, n_mask)
+                    uncond = self.predict(model, latents, sig, n_emb, n_mask, context)
                     pred = uncond + cfg * (pred - uncond)
                 latents = sched.step(pred, t, latents, return_dict=False)[0]
                 if progress:
@@ -526,6 +652,10 @@ class Fibo2Backend(Backend):
 
     def negative_prompt(self, prompt):
         return FIBO_RAW + (prompt or FIBO_NULL_CAPTION)
+
+    def comfyui_lora(self, sd):
+        from .comfy_fibo import comfyui_state_dict
+        return comfyui_state_dict(sd)
 
     def prompt_parts(self, prompt):
         from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import BriaFibo2Pipeline

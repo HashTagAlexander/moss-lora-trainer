@@ -62,7 +62,8 @@ def build(tmp: Path):
     from huggingface_hub import snapshot_download
     from transformers import Qwen3VLConfig, Qwen3VLModel
     te_dir = tmp / "te"
-    tok = snapshot_download("Qwen/Qwen3-VL-4B-Instruct", allow_patterns=["tokenizer*", "vocab.json", "merges.txt", "*.jinja"])
+    keep = ["tokenizer*", "vocab.json", "merges.txt", "*.jinja", "*preprocessor_config.json"]
+    tok = snapshot_download("Qwen/Qwen3-VL-4B-Instruct", allow_patterns=keep)
     cfg = Qwen3VLConfig(
         text_config=dict(hidden_size=TD, num_hidden_layers=36, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
                          intermediate_size=128, vocab_size=151936,
@@ -72,8 +73,9 @@ def build(tmp: Path):
                            deepstack_visual_indexes=[0]))
     torch.manual_seed(0)
     Qwen3VLModel(cfg).save_pretrained(te_dir)
-    for f in Path(tok).iterdir():
-        (te_dir / f.name).write_bytes(f.read_bytes())
+    for f in Path(tok).iterdir():  # the snapshot folder can also hold other files fetched earlier (the real config)
+        if any(f.match(p) for p in keep):
+            (te_dir / f.name).write_bytes(f.read_bytes())
     AutoencoderKLQwenImage(base_dim=16, dim_mult=[1, 1, 1, 1], num_res_blocks=1).save_pretrained(tmp / "vae")
     tiny_original_checkpoint(tmp / "tiny-kroma.safetensors")
     spec = {"tiny-krea2": {"label": "tiny Krea 2", "family": "krea2", "trainable": True,
