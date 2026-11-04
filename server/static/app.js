@@ -70,6 +70,8 @@ const I = {
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 21h16"/></svg>',
+  prompt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 4 4L19 7"/></svg>',
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0-5 5m5-5 5 5M4 20h16"/></svg>',
   reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>',
   image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>',
@@ -207,7 +209,8 @@ async function refreshGpu() {
     const el = $("#sidebar-gpu");
     if (!g.gpus.length) { el.innerHTML = '<div class="faint">No NVIDIA GPU detected</div>'; return; }
     el.innerHTML = g.gpus.map((x) => `
-      <div class="gpu-name">${esc(x.name)}</div>
+      <div class="gpu-name">${g.gpus.length > 1 ? `GPU ${x.index} · ` : ""}${esc(x.name)}</div>
+      ${x.job ? `<div class="gpu-job" title="Training on this GPU">${esc(x.job)}</div>` : ""}
       <div class="row" style="justify-content:space-between"><span>GPU</span><span>${x.util ?? "—"}%</span></div>
       <div class="mini-bar"><div style="width:${x.util || 0}%"></div></div>
       <div class="row" style="justify-content:space-between"><span>VRAM</span><span>${(x.mem_used / 1024).toFixed(1)} / ${(x.mem_total / 1024).toFixed(0)} GB</span></div>
@@ -227,14 +230,16 @@ async function pageDashboard() {
   every(async () => {
     const [jobs, g] = await Promise.all([api("/api/jobs"), api("/api/gpu")]);
     const gpu = g.gpus[0];
-    $("#gpu-stats").innerHTML = (gpu ? [
+    $("#gpu-stats").innerHTML = (g.gpus.length > 1 ? g.gpus.map((x) => [`GPU ${x.index}`, x.name.replace("NVIDIA ", ""),
+      `${x.util ?? 0}% · ${(x.mem_used / 1024).toFixed(1)} of ${(x.mem_total / 1024).toFixed(0)} GB · ${x.temp ?? "—"}°C${x.job ? ` · training ${x.job}` : ""}`])
+    : gpu ? [
       ["GPU", gpu.name.replace("NVIDIA ", ""), `${gpu.util ?? 0}% utilization`],
       ["VRAM", `${(gpu.mem_used / 1024).toFixed(1)} GB`, `of ${(gpu.mem_total / 1024).toFixed(0)} GB`],
       ["Temperature", `${gpu.temp ?? "—"}°C`, `${gpu.power ? Math.round(gpu.power) : "—"} W draw`],
     ] : [["GPU", "None", "nvidia-smi not found"]]).concat([["Disk free", fmtBytes(g.disk?.free), `of ${fmtBytes(g.disk?.total)}`]])
       .map(([l, v, h]) => `<div class="card stat"><div class="label">${l}</div><div class="value" style="font-size:${v.length > 14 ? 16 : 22}px">${esc(v)}</div><div class="hint">${esc(h)}</div></div>`).join("");
 
-    const key = JSON.stringify(jobs);
+    const key = JSON.stringify([jobs, g.gpus.length]);
     if (key === jobsKey) return;
     jobsKey = key;
     const el = $("#jobs");
@@ -249,7 +254,7 @@ async function pageDashboard() {
         return `<tr class="click" data-job="${esc(j.name)}">
           <td><b>${esc(j.name)}</b><div class="faint" style="font-size:12px">${esc((j.model || "").split("/").pop())}</div></td>
           <td>${esc(j.dataset)}</td>
-          <td>${badge(st.state || "new")}</td>
+          <td>${badge(st.state || "new")}${g.gpus.length > 1 && ACTIVE.has(st.state) && st.gpu != null ? `<div class="faint" style="font-size:12px;margin-top:3px">GPU ${st.gpu}</div>` : ""}</td>
           <td><div class="row" style="gap:10px;flex-wrap:nowrap"><div class="progress grow"><div style="width:${pct(st)}%"></div></div>
             <span class="mono muted">${st.step || 0}/${st.total_steps || j.steps}</span></div></td>
           <td class="mono muted">${st.state === "training" ? fmtDur(st.eta_seconds) : "—"}</td>
@@ -433,7 +438,7 @@ async function pageJob(name) {
     $("#j-badge").innerHTML = badge(st.state || "new");
     $("#j-bar").style.width = `${pct(st)}%`;
     $("#j-step").textContent = `${st.step || 0} / ${st.total_steps || job.config.train.steps} steps`;
-    $("#j-msg").textContent = st.message || (st.state === "training" ? "Training…" : STATE_LABEL[st.state] || "");
+    $("#j-msg").textContent = (ACTIVE.has(st.state) && st.gpu != null ? `GPU ${st.gpu} · ` : "") + (st.message || (st.state === "training" ? "Training…" : STATE_LABEL[st.state] || ""));
     if (st.state === "error") $("#j-msg").style.color = "var(--red)"; else $("#j-msg").style.color = "";
     $("#j-stats").innerHTML = [
       ["Loss", fmtLoss(st.loss)],
@@ -554,7 +559,7 @@ function readForm(root, cfg) {
 
 async function pageNewJob(params) {
   if (!INFO) INFO = await api("/api/info");
-  const datasets = await api("/api/datasets");
+  const [datasets, { gpus }] = await Promise.all([api("/api/datasets"), api("/api/gpu")]);
   let cfg = JSON.parse(JSON.stringify(INFO.defaults));
   let mode = "new";
   if (params.edit || params.clone) {
@@ -574,6 +579,8 @@ async function pageNewJob(params) {
       F.sel("dataset", "Dataset", datasets.length ? datasets.map((d) => [d.name, `${d.name} (${d.count} ${d.type === "edit" ? "edit pairs" : "images"})`]) : [["", "— create a dataset first —"]],
         `<a href="#/datasets">Manage datasets</a>`),
       F.text("trigger_word", "Trigger word", "Prepended to captions; replaces <span class='mono'>[trigger]</span> in captions and sample prompts."),
+      ...(gpus.length > 1 || (cfg.train.gpu ?? "auto") !== "auto" ? [F.sel("train.gpu", "GPU", [["auto", "Auto (a free GPU)"], ...gpus.map((x) => [x.index, `GPU ${x.index} · ${x.name.replace("NVIDIA ", "")}`])],
+        "Each GPU trains one job at a time; others wait in the queue. You can run a job per GPU side by side.")] : []),
     ]],
     ["Network", [
       F.sel("network.type", "Adapter", [["lora", "LoRA"], ["lokr", "LoKr (Kronecker)"]], "LoKr (LyCORIS): delta W = kron(w1, w2), often holds likeness and style with fewer parameters. Rank, alpha and dropout are LoRA-only."),
@@ -1111,7 +1118,7 @@ async function pageGenerate(params) {
   if (!INFO) INFO = await api("/api/info");
   let loras = await api("/api/loras");
   const defaults = { prompt: "", negative: "", loras: [], aspect: "1:1", mp: 1, width: 1024, height: 1024, steps: 50,
-    cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model, image: "" };
+    cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model, image: "", gpu: "auto" };
   const st = { ...defaults, ...loadGenState() };
   st.loras = (st.loras || []).filter((l) => loras.some((x) => x.id === l.id));
   if (params.lora) {
@@ -1156,15 +1163,16 @@ async function pageGenerate(params) {
           <label class="field" style="grid-column:1/-1">Base model<select id="g-model">${Object.entries(INFO.models).map(([k, v]) => `<option value="${esc(k)}">${esc(v)}</option>`).join("")}</select></label>
           <label class="field">Shift<input type="number" id="g-shift" step="0.1"></label>
           <label class="field">Skip layer<input type="number" id="g-skip" min="-1" max="41" title="Negative-branch layer skip, -1 = off"></label></div></details>
+        <label class="field" id="g-gpu-field" hidden>GPU<select id="g-gpu"><option value="auto">Auto</option></select></label>
         <div class="faint" id="g-model-badge" style="font-size:12px;margin-bottom:-6px"></div>
         <button class="btn btn-primary" id="g-go">${I.spark} Generate</button>
       </div></div>
-      <div class="gen-results"><div class="card" id="g-status"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
+      <div class="gen-results"><div class="card" id="g-status"></div><div id="g-tools" class="gen-tools"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
     </div>`;
 
   // ---- form <-> state
   const fields = { prompt: "#g-prompt", negative: "#g-negative", width: "#g-w", height: "#g-h", steps: "#g-steps", cfg: "#g-cfg",
-    count: "#g-count", seed: "#g-seed", shift: "#g-shift", skip_layer: "#g-skip", model: "#g-model", mp: "#g-mp" };
+    count: "#g-count", seed: "#g-seed", shift: "#g-shift", skip_layer: "#g-skip", model: "#g-model", mp: "#g-mp", gpu: "#g-gpu" };
   const numeric = new Set(["width", "height", "steps", "cfg", "count", "seed", "shift", "skip_layer", "mp"]);
   for (const [k, sel] of Object.entries(fields)) $(sel).value = st[k];
   const syncAspect = () => $$("#g-aspects .chip").forEach((c) => c.classList.toggle("on", c.dataset.aspect === st.aspect));
@@ -1305,25 +1313,43 @@ async function pageGenerate(params) {
 
   // ---- status
   const W_LABEL = { unloaded: "Model not loaded", starting: "Starting", loading: "Loading model", idle: "Starting", ready: "Model ready", generating: "Generating", exiting: "Unloading" };
+  function renderGpuPicker(gpus) {
+    $("#g-gpu-field").hidden = gpus.length < 2;
+    if (gpus.length && !gpus.some((x) => String(x.index) === String(st.gpu))) st.gpu = "auto";
+    const pick = $("#g-gpu");
+    if (document.activeElement === pick) return;  // don't close an open list under the user
+    const options = [`<option value="auto">Auto (least busy)</option>`, ...gpus.map((x) => {
+      const mem = `${(x.mem_used / 1024).toFixed(0)}/${(x.mem_total / 1024).toFixed(0)} GB`;
+      return `<option value="${x.index}">GPU ${x.index} · ${esc(x.name.replace("NVIDIA ", ""))} · ${mem}${x.job ? ` · training ${esc(x.job)}` : ""}</option>`;
+    })].join("");
+    if (pick.dataset.options !== options) { pick.innerHTML = options; pick.dataset.options = options; }
+    pick.value = st.gpu;
+  }
   async function refreshStatus() {
     const g = await api("/api/generate/status");
-    const busy = g.current || g.queue.length;
-    $("#g-worker").innerHTML = `<span class="badge ${g.state === "ready" ? "done" : g.state === "unloaded" ? "" : "running"}">${esc(W_LABEL[g.state] || g.state)}${g.model ? ` · ${esc(g.model.split("/").pop())}` : ""}</span>
-      ${g.state !== "unloaded" ? `<button class="btn btn-sm btn-ghost" id="g-unload" title="Free GPU memory">Unload</button>` : ""}`;
+    renderGpuPicker(g.gpus);
+    const many = g.gpus.length > 1;
+    const where = (w) => (many && w.gpu != null ? `GPU ${w.gpu} · ` : "");
+    $("#g-worker").innerHTML = g.workers.length ? g.workers.map((w) => `<span class="badge ${w.state === "ready" ? "done" : w.state === "unloaded" ? "" : "running"}">${where(w)}${esc(W_LABEL[w.state] || w.state)}${w.model ? ` · ${esc(w.model.split("/").pop())}` : ""}</span>
+      ${w.state !== "unloaded" ? `<button class="btn btn-sm btn-ghost" data-unload="${w.gpu ?? "all"}" title="Free GPU memory">Unload</button>` : ""}`).join("")
+      : `<span class="badge">${W_LABEL.unloaded}</span>`;
     let html = "";
-    if (g.current) {
-      const p = g.current.progress;
-      const frac = p ? (p.image + p.step / p.steps) / p.count : 0;
-      html += `<div class="card-body"><div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(g.current.prompt)}</div>
-        <button class="btn btn-sm" data-cancel="${esc(g.current.id)}">${I.stop} Cancel</button></div>
-        <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
-        <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}` : esc(g.message || "Preparing…")}</div></div>`;
+    const line = (text, style = "") => `<div class="card-body ${style ? "" : "faint"}" style="font-size:${style ? 13 : 12}px;${style}">${text}</div>`;
+    for (const w of g.workers) {
+      if (w.current) {
+        const p = w.current.progress;
+        const frac = p ? (p.image + p.step / p.steps) / p.count : 0;
+        html += `<div class="card-body"><div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(where(w))}${esc(w.current.prompt)}</div>
+          <button class="btn btn-sm" data-cancel="${esc(w.current.id)}">${I.stop} Cancel</button></div>
+          <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
+          <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}` : esc(w.message || "Preparing…")}</div></div>`;
+      }
+      if (w.queue.length) html += line(`${esc(where(w))}${w.queue.length} more queued`);
+      if (w.training && (w.current || w.queue.length)) html += line(`${esc(w.training)} is training on ${many ? `GPU ${w.gpu}` : "the GPU"}, so the text encoder stays off the GPU and new prompts encode a little slower.`);
+      if (w.last_error) html += line(`${esc(where(w))}${esc(w.last_error)}`, "color:var(--red)");
     }
-    if (g.queue.length) html += `<div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">${g.queue.length} more queued</div>`;
-    if (g.training && busy) html += `<div class="card-body faint" style="font-size:12px;border-top:1px solid var(--border)">A training job is running, so the text encoder stays off the GPU and new prompts encode a little slower.</div>`;
-    if (g.last_error) html += `<div class="card-body" style="color:var(--red);font-size:13px;border-top:1px solid var(--border)">${esc(g.last_error)}</div>`;
-    if (!html) html = `<div class="card-body faint" style="font-size:13px">${g.state === "unloaded" ? "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes." : "Ready. Write a prompt and hit Generate."}</div>`;
+    if (!html) html = `<div class="card-body faint" style="font-size:13px">${g.workers.some((w) => w.state !== "unloaded") ? "Ready. Write a prompt and hit Generate." : "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes."}</div>`;
     $("#g-status").innerHTML = html;
     if (g.version !== lastVersion) { lastVersion = g.version; loadGallery(); }
   }
@@ -1332,7 +1358,8 @@ async function pageGenerate(params) {
     if (c) { await guard(() => api(`/api/generate/cancel/${enc(c.dataset.cancel)}`, { method: "POST" })); refreshStatus(); }
   };
   $("#g-worker").onclick = async (e) => {
-    if (e.target.closest("#g-unload")) { await guard(() => api("/api/generate/unload", { method: "POST" }), "Model unloaded"); refreshStatus(); }
+    const u = e.target.closest("[data-unload]");
+    if (u) { await guard(() => api(`/api/generate/unload?gpu=${enc(u.dataset.unload)}`, { method: "POST" }), "Model unloaded"); refreshStatus(); }
   };
 
   // ---- gallery
@@ -1340,21 +1367,88 @@ async function pageGenerate(params) {
   const fileUrl = (f) => `/api/generations/file/${enc(f)}`;
   const describe = (it) => [...(it.image_id ? ["edit"] : []), `seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
     ...(it.loras || []).map((l) => `${l.name} @ ${l.strength}`)].join(" · ");
+  // selecting: click cards to pick them (shift-click for a range), then download them together
+  let selecting = false, anchor = null, withPrompts = true;
+  const picked = new Set();
+  function renderTools() {
+    const n = picked.size;
+    $("#g-tools").innerHTML = !items.length ? "" : selecting
+      ? `<span class="gen-count">${n} selected</span>
+         <button class="btn btn-sm" id="g-all">All ${items.length} shown</button>
+         <button class="btn btn-sm" id="g-none" ${n ? "" : "disabled"}>None</button>
+         <span class="grow"></span>
+         <label class="check" style="font-size:13px"><input type="checkbox" id="g-with-prompts" ${withPrompts ? "checked" : ""}> Include prompts (.txt)</label>
+         <button class="btn btn-sm btn-primary" id="g-zip" ${n ? "" : "disabled"}>${I.download} Download ${n || ""}</button>
+         <button class="btn btn-sm" id="g-select-done">Done</button>`
+      : `<span class="grow"></span><button class="btn btn-sm" id="g-select">${I.check} Select</button>`;
+    $("#g-gallery").classList.toggle("selecting", selecting);
+    $$("#g-gallery .gen-card").forEach((c) => c.classList.toggle("picked", picked.has(items[+c.dataset.i]?.file)));
+  }
+  function downloadPicked() {  // a real form post: the browser saves the zip itself, however large it is
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "/api/generations/zip";
+    form.hidden = true;
+    for (const [name, value] of [["files", JSON.stringify([...picked])], ["prompts", withPrompts ? "1" : ""]]) {
+      const input = document.createElement("input");
+      Object.assign(input, { type: "hidden", name, value });
+      form.append(input);
+    }
+    document.body.append(form);
+    form.submit();
+    form.remove();
+  }
+  $("#g-tools").addEventListener("click", (e) => {
+    const on = (sel) => e.target.closest(sel);
+    if (on("#g-select")) selecting = true;
+    else if (on("#g-select-done")) { selecting = false; picked.clear(); anchor = null; }
+    else if (on("#g-all")) items.forEach((it) => picked.add(it.file));
+    else if (on("#g-none")) { picked.clear(); anchor = null; }
+    else if (on("#g-zip")) return downloadPicked();
+    else return;
+    renderTools();
+  });
+  $("#g-tools").addEventListener("change", (e) => { if (e.target.id === "g-with-prompts") withPrompts = e.target.checked; });
   async function loadGallery() {
     const r = await api(`/api/generations?limit=${limit}`);
     items = r.items;
+    for (const f of [...picked]) if (!items.some((it) => it.file === f)) picked.delete(f);
     $("#g-gallery").innerHTML = items.length ? items.map((it, i) => `
       <div class="gen-card" data-i="${i}">
+        <span class="gen-tick">${I.check}</span>
         <img loading="lazy" src="${fileUrl(it.thumb)}" style="aspect-ratio:${it.width}/${it.height}" data-open="${i}">
         <div class="gen-ov"><div class="gen-ov-text">${esc(it.prompt)}</div><div class="row" style="gap:4px;flex-wrap:nowrap">
           <button class="btn btn-sm" data-reuse="${i}" title="Use these settings">${I.reuse}</button>
           <a class="btn btn-sm" href="${fileUrl(it.file)}" download title="Download PNG">${I.download}</a>
+          <button class="btn btn-sm" data-both="${i}" title="Download PNG and its prompt (.txt with the same name)">${I.prompt}</button>
           <button class="btn btn-sm btn-danger" data-del="${i}" title="Delete">${I.trash}</button></div></div></div>`).join("")
       : `<div class="card empty" style="grid-column:1/-1">${I.image}<div>Generated images will show up here</div></div>`;
     $("#g-more").innerHTML = r.total > items.length ? `<div style="text-align:center;margin-top:14px"><button class="btn" id="g-load-more">Show more (${r.total - items.length})</button></div>` : "";
+    renderTools();
   }
   $("#g-more").onclick = (e) => { if (e.target.closest("#g-load-more")) { limit += 60; loadGallery(); } };
   $("#g-gallery").addEventListener("click", async (e) => {
+    if (selecting) {
+      const card = e.target.closest(".gen-card");
+      if (!card) return;
+      const i = +card.dataset.i, adding = !picked.has(items[i].file);
+      const [from, to] = e.shiftKey && anchor != null ? [Math.min(anchor, i), Math.max(anchor, i)] : [i, i];
+      for (let k = from; k <= to; k++) { if (adding) picked.add(items[k].file); else picked.delete(items[k].file); }
+      anchor = i;
+      renderTools();
+      return;
+    }
+    const both = e.target.closest("[data-both]");
+    if (both) {  // two plain downloads, so they land side by side (the browser may ask once to allow that)
+      const f = items[+both.dataset.both].file;
+      [fileUrl(f), `/api/generations/prompt/${enc(f)}`].forEach((href, k) => setTimeout(() => {
+        const a = Object.assign(document.createElement("a"), { href, download: "" });
+        document.body.append(a);
+        a.click();
+        a.remove();
+      }, k * 300));
+      return;
+    }
     const open = e.target.closest("[data-open]"), reuse = e.target.closest("[data-reuse]"), del = e.target.closest("[data-del]");
     if (open) lightbox(items.map((it) => ({ src: fileUrl(it.file), title: describe(it), caption: it.prompt, layout: VGL.layout(it.prompt) })), +open.dataset.open);
     if (reuse) {

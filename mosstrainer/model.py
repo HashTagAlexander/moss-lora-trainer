@@ -246,7 +246,7 @@ def resolve_model(model: str) -> str:
     return snapshot_download(model, allow_patterns=[
         "model_index.json", "*.py", "scheduler/*", "text_encoder/*", "tokenizer/*",
         "transformer/*", "vae/*",
-    ])
+    ], ignore_patterns=["vae/flux2-vae_small.safetensors"])  # Kromoss: the ComfyUI copy of the same VAE
 
 
 def load_transformer(root: str, dtype=torch.bfloat16) -> MOSSImageTransformer:

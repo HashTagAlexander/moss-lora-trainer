@@ -59,6 +59,7 @@ h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: 
 .nav svg { width: 17px; height: 17px; flex: none; }
 .sidebar-gpu { margin-top: auto; padding: 12px 10px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
 .sidebar-gpu .gpu-name { color: var(--text); font-weight: 600; margin-bottom: 6px; font-size: 12px; }
+.gpu-job { font-size: 11px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 4px; }
 .mini-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin: 3px 0 8px; }
 .mini-bar > div { height: 100%; background: var(--accent); transition: width .4s; }
 
@@ -245,11 +246,22 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .gen-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; margin-top: 16px; align-items: start; }
 .gen-card { position: relative; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: var(--panel-2); }
 .gen-card img { width: 100%; display: block; object-fit: cover; cursor: zoom-in; }
-.gen-ov { position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 8px 8px; display: flex; gap: 6px; align-items: flex-end; background: linear-gradient(transparent, rgba(5, 6, 9, .9)); opacity: 0; transition: opacity .15s; pointer-events: none; }
+.gen-ov { position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 8px 8px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; align-items: flex-end; background: linear-gradient(transparent, rgba(5, 6, 9, .9)); opacity: 0; transition: opacity .15s; pointer-events: none; }
 .gen-card:hover .gen-ov { opacity: 1; pointer-events: auto; }
-.gen-ov-text { flex: 1; min-width: 0; font-size: 11.5px; color: #d6dae3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.gen-ov-text { flex: 1 0 100%; min-width: 0; font-size: 11.5px; color: #d6dae3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .gen-ov .btn { padding: 5px; background: rgba(22, 26, 34, .9); }
 @media (hover: none) { .gen-ov { opacity: 1; pointer-events: auto; } }
+.gen-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; min-height: 30px; }
+.gen-tools .grow { flex: 1; }
+.gen-count { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.gen-tick { display: none; position: absolute; top: 8px; left: 8px; z-index: 1; width: 22px; height: 22px; padding: 4px; border-radius: 50%; border: 1.5px solid rgba(255, 255, 255, .75); background: rgba(5, 6, 9, .55); color: transparent; }
+.gen-tick svg { display: block; }
+.gen-gallery.selecting { user-select: none; }
+.gen-gallery.selecting .gen-ov { display: none; }
+.gen-gallery.selecting .gen-tick { display: block; }
+.gen-gallery.selecting .gen-card img { cursor: pointer; }
+.gen-gallery.selecting .gen-card.picked { outline: 2px solid var(--accent); outline-offset: -2px; }
+.gen-gallery.selecting .gen-card.picked .gen-tick { background: var(--accent); border-color: var(--accent); color: #fff; }
 @media (max-width: 860px) { .gen-layout { grid-template-columns: 1fr; } .gen-controls { position: static; } }
 
 /* ---------- settings ---------- */

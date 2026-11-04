@@ -19,14 +19,17 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -136,9 +139,68 @@ def pid_alive(pid) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- GPUs
+
+_gpu_cache = {"at": 0.0, "gpus": []}
+_gpu_lock = threading.Lock()
+
+
+def _read_gpus() -> list[dict]:
+    fields = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit"
+    try:
+        out = subprocess.run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 8:
+            continue
+
+        def num(v):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        gpus.append({"index": int(parts[0]), "name": parts[1], "util": num(parts[2]), "mem_used": num(parts[3]),
+                     "mem_total": num(parts[4]), "temp": num(parts[5]), "power": num(parts[6]),
+                     "power_limit": num(parts[7])})
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")  # the server itself may be limited to some GPUs
+    if visible is not None and all(v.strip().isdigit() for v in visible.split(",") if v.strip()):
+        allowed = {int(v) for v in visible.split(",") if v.strip()}
+        gpus = [g for g in gpus if g["index"] in allowed]
+    return gpus
+
+
+def gpu_list() -> list[dict]:
+    """The GPUs we may use, by nvidia-smi index (cached briefly: the pages poll this)."""
+    with _gpu_lock:
+        if time.time() - _gpu_cache["at"] > 2:
+            _gpu_cache.update(at=time.time(), gpus=_read_gpus())
+        return _gpu_cache["gpus"]
+
+
+def free_memory(gpu: dict) -> float:
+    return (gpu["mem_total"] or 0) - (gpu["mem_used"] or 0)
+
+
+def gpu_env(gpu: int | None) -> dict:
+    """The environment for a process that should see only this GPU; None leaves the choice to torch."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if gpu is not None:
+        env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=str(gpu), MOSS_GPU=str(gpu))
+    return env
+
+
 # --------------------------------------------------------------------------- job manager
 
+_WAIT = object()  # no GPU free for a queued job yet
+
+
 class JobManager:
+    """One training job per GPU; queued jobs start as soon as a GPU they can use is free."""
+
     def __init__(self):
         self.lock = threading.RLock()
         self.procs: dict[str, subprocess.Popen] = {}
@@ -160,29 +222,52 @@ class JobManager:
             if st and st.get("state") in ACTIVE and not pid_alive(st.get("pid")):
                 self.set_status(d.name, state="error", message="Trainer process ended unexpectedly (server restart?)")
 
-    def running(self):
+    def busy_gpus(self) -> dict:
+        """GPU index -> the job training on it (None is the only key on a machine without nvidia-smi)."""
+        busy = {}
+        gpus = gpu_list()
+
+        def add(name, st):  # a job started before GPUs could be picked trains on the first one
+            busy[st.get("gpu", gpus[0]["index"] if gpus else None)] = name
         for d in JOBS.iterdir():
             st = read_json(d / "status.json")
             if st and st.get("state") in ACTIVE and pid_alive(st.get("pid")):
-                return d.name
+                add(d.name, st)
         for name, p in self.procs.items():
-            if p.poll() is None:
-                return name
-        return None
+            if p.poll() is None and name not in busy.values():
+                add(name, self.status(name))
+        return busy
 
-    def _launch(self, name):
+    def wanted_gpu(self, name):
+        gpu = read_json(JOBS / name / "config.json", {}).get("train", {}).get("gpu", "auto")
+        return int(gpu) if str(gpu).isdigit() else "auto"
+
+    def _slot(self, name, gpus, busy):
+        """The GPU a queued job can start on now, or _WAIT. Raises ValueError for a GPU that isn't here."""
+        want = self.wanted_gpu(name)
+        if not gpus:  # no nvidia-smi: one job at a time, as torch sees fit
+            return _WAIT if None in busy else None
+        free = [g for g in gpus if g["index"] not in busy]
+        if want == "auto":
+            return max(free, key=free_memory)["index"] if free else _WAIT
+        if not any(g["index"] == want for g in gpus):
+            raise ValueError(f"GPU {want} isn't available on this machine. Edit the job and pick another.")
+        return want if want not in busy else _WAIT
+
+    def _launch(self, name, gpu):
         job_dir = JOBS / name
         log = open(job_dir / "log.txt", "a")
-        log.write(f"\n===== start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        where = "" if gpu is None else f" on GPU {gpu}"
+        log.write(f"\n===== start {time.strftime('%Y-%m-%d %H:%M:%S')}{where} =====\n")
         log.flush()
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         proc = subprocess.Popen([sys.executable, "-m", "mosstrainer.train", "--job-dir", str(job_dir)],
-                                cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, env=env,
+                                cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT, env=gpu_env(gpu),
                                 start_new_session=True)
         self.procs[name] = proc
         if "gen_manager" in globals():
-            gen_manager.offload_te()  # give the trainer room on the GPU
-        self.set_status(name, state="starting", pid=proc.pid, message="Starting trainer", step=self.status(name).get("step", 0))
+            gen_manager.offload_te(gpu)  # give the trainer room on the GPU
+        self.set_status(name, state="starting", pid=proc.pid, gpu=gpu, message="Starting trainer",
+                        step=self.status(name).get("step", 0))
 
     def _loop(self):
         while True:
@@ -196,14 +281,22 @@ class JobManager:
                         st = self.status(name)
                         if st.get("state") in ACTIVE:
                             self.set_status(name, state="error", message=f"Trainer exited with code {code}; see log")
-                    if not self.running():
-                        queued = []
-                        for d in JOBS.iterdir():
-                            st = read_json(d / "status.json")
-                            if st and st.get("state") == "queued":
-                                queued.append((st.get("queued_at", 0), d.name))
-                        if queued:
-                            self._launch(sorted(queued)[0][1])
+                    queued = []
+                    for d in JOBS.iterdir():
+                        st = read_json(d / "status.json")
+                        if st and st.get("state") == "queued":
+                            queued.append((st.get("queued_at", 0), d.name))
+                    if queued:
+                        gpus, busy = gpu_list(), self.busy_gpus()
+                        for _, name in sorted(queued):
+                            try:
+                                gpu = self._slot(name, gpus, busy)
+                            except ValueError as e:
+                                self.set_status(name, state="error", message=str(e))
+                                continue
+                            if gpu is not _WAIT:
+                                self._launch(name, gpu)
+                                busy[gpu] = name
             except Exception as e:  # noqa: BLE001
                 print("job loop error:", e, flush=True)
             time.sleep(2)
@@ -213,7 +306,9 @@ class JobManager:
             st = self.status(name)
             if st.get("state") in ACTIVE or st.get("state") == "queued":
                 return st
-            return self.set_status(name, state="queued", queued_at=time.time(), message="Waiting for GPU")
+            want = self.wanted_gpu(name)
+            return self.set_status(name, state="queued", queued_at=time.time(),
+                                   message="Waiting for a free GPU" if want == "auto" else f"Waiting for GPU {want}")
 
     def stop(self, name, force=False):
         with self.lock:
@@ -237,10 +332,12 @@ manager = JobManager()
 
 # --------------------------------------------------------------------------- generation worker
 
-class GenManager:
-    """Runs mosstrainer.generate_worker as a long-lived subprocess and feeds it one request at a time."""
+class GenWorker:
+    """Runs mosstrainer.generate_worker on one GPU as a long-lived subprocess and feeds it one request at a time."""
 
-    def __init__(self):
+    def __init__(self, gpu: int | None):
+        self.gpu = gpu
+        self.log_name = "worker.log" if gpu is None else f"worker-gpu{gpu}.log"
         self.lock = threading.RLock()
         self.proc: subprocess.Popen | None = None
         self.queue: list[dict] = []
@@ -250,15 +347,13 @@ class GenManager:
         self.message = ""
         self.last_error = ""
         self.version = 0  # bumps whenever a new image lands
-        self.counter = 0
 
     def _spawn(self):
-        log = open(GENERATIONS / "worker.log", "a")
+        log = open(GENERATIONS / self.log_name, "a")
         log.write(f"\n===== worker start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         log.flush()
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         self.proc = subprocess.Popen([sys.executable, "-m", "mosstrainer.generate_worker"], cwd=str(ROOT),
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, env=env,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, env=gpu_env(self.gpu),
                                      text=True, bufsize=1, start_new_session=True)
         self.state, self.model, self.message = "starting", None, "Starting worker…"
         threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
@@ -294,7 +389,7 @@ class GenManager:
                 self.proc = None
                 self.state, self.model, self.message = "unloaded", None, ""
                 if self.current:
-                    self.last_error = "Generation worker crashed; see workspace/generations/worker.log"
+                    self.last_error = f"Generation worker crashed; see workspace/generations/{self.log_name}"
                     self.current = None
                 self._dispatch()
 
@@ -304,7 +399,7 @@ class GenManager:
         if self.proc is None or self.proc.poll() is not None:
             self._spawn()
         req = self.queue.pop(0)
-        req["low_vram"] = manager.running() is not None
+        req["low_vram"] = self.gpu in manager.busy_gpus()
         req["out_dir"] = str(GENERATIONS)
         self.current = req
         try:
@@ -314,15 +409,12 @@ class GenManager:
             self.current = None
             self.queue.insert(0, req)
 
-    def submit(self, req: dict) -> str:
+    def submit(self, req: dict):
         with self.lock:
-            self.counter += 1
-            req["id"] = f"{int(time.time()) % 100000:05d}{self.counter:03d}"
             req["queued_at"] = time.time()
             self.last_error = ""
             self.queue.append(req)
             self._dispatch()
-            return req["id"]
 
     def cancel(self, rid: str):
         with self.lock:
@@ -351,19 +443,101 @@ class GenManager:
             if not self.current and not self.queue and self.proc and self.proc.poll() is None:
                 self.proc.terminate()
 
-    def snapshot(self):
+    def active(self):
+        with self.lock:
+            return bool(self.current or self.queue or self.last_error or (self.proc and self.proc.poll() is None))
+
+    def busy(self):
+        with self.lock:
+            return len(self.queue) + (1 if self.current else 0)
+
+    def snapshot(self, training):
         with self.lock:
             brief = lambda r: {"id": r["id"], "prompt": r.get("prompt", "")[:200], "count": r.get("count", 1)}  # noqa: E731
             cur = None
             if self.current:
                 cur = {**brief(self.current), "progress": self.current.get("progress"),
                        "files": self.current.get("files", [])}
-            return {"state": self.state, "model": self.model, "message": self.message, "current": cur,
+            return {"gpu": self.gpu, "state": self.state, "model": self.model, "message": self.message, "current": cur,
                     "queue": [brief(q) for q in self.queue], "last_error": self.last_error,
-                    "version": self.version, "training": manager.running()}
+                    "training": training.get(self.gpu)}
+
+
+class GenManager:
+    """One worker per GPU, started when first asked for, so GPUs generate side by side and keep their models loaded."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.workers: dict[int | None, GenWorker] = {}
+        self.counter = 0
+
+    def _worker(self, gpu):
+        with self.lock:
+            if gpu not in self.workers:
+                self.workers[gpu] = GenWorker(gpu)
+            return self.workers[gpu]
+
+    def _pick(self, want, model):
+        """The GPU for a request: the one asked for, or on auto the one with the least going on."""
+        gpus = gpu_list()
+        if not gpus:
+            return None
+        if want != "auto":
+            if not any(g["index"] == want for g in gpus):
+                raise ValueError(f"GPU {want} isn't available on this machine")
+            return want
+        training = manager.busy_gpus()
+
+        def rank(g):
+            w = self.workers.get(g["index"])
+            return (g["index"] in training, w.busy() if w else 0, not (w and w.model == model), -free_memory(g))
+        return min(gpus, key=rank)["index"]
+
+    def submit(self, req: dict, want="auto") -> str:
+        with self.lock:
+            worker = self._worker(self._pick(want, req.get("model")))
+            self.counter += 1
+            req["id"] = f"{int(time.time()) % 100000:05d}{self.counter:03d}"
+        worker.submit(req)
+        return req["id"]
+
+    def _all(self):
+        with self.lock:
+            return list(self.workers.values())
+
+    def cancel(self, rid: str):
+        for w in self._all():
+            w.cancel(rid)
+
+    def offload_te(self, gpu):
+        with self.lock:
+            worker = self.workers.get(gpu)
+        if worker:
+            worker.offload_te()
+
+    def unload(self, gpu="all"):
+        for w in self._all():
+            if gpu == "all" or w.gpu == gpu:
+                w.unload()
+
+    def restart_if_idle(self):
+        for w in self._all():
+            w.restart_if_idle()
+
+    def snapshot(self):
+        workers, training = self._all(), manager.busy_gpus()
+        return {"workers": [w.snapshot(training) for w in sorted(workers, key=lambda w: -1 if w.gpu is None else w.gpu)
+                            if w.active()],
+                "version": sum(w.version for w in workers), "gpus": gpu_status()}
 
 
 gen_manager = GenManager()
+
+
+def gpu_status() -> list[dict]:
+    """The GPU list with the job training on each."""
+    busy = manager.busy_gpus()
+    return [{**g, "job": busy.get(g["index"])} for g in gpu_list()]
 
 
 # --------------------------------------------------------------------------- model downloads
@@ -500,8 +674,10 @@ class AutomaskManager:
             log = open(WORKSPACE / "cache" / f"automask-{dataset}.log", "w")
             cmd = [sys.executable, "-m", "mosstrainer.automask", "--dataset", str(folder), "--keep", keep,
                    "--remove", remove] + (["--overwrite"] if overwrite else [])
+            gpus = gpu_list()
             proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=log, text=True,
-                                    env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
+                                    env=gpu_env(max(gpus, key=free_memory)["index"] if gpus else None),
+                                    start_new_session=True)
             st = {"proc": proc, "state": "running", "done": 0, "total": None, "message": "Starting", "keep": keep}
             self.runs[dataset] = st
         threading.Thread(target=self._read, args=(dataset, st), daemon=True).start()
@@ -627,29 +803,8 @@ async def download_model(request: Request):
 
 @app.get("/api/gpu")
 def gpu():
-    fields = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit"
     disk = shutil.disk_usage(WORKSPACE)
-    disk = {"free": disk.free, "total": disk.total}
-    try:
-        out = subprocess.run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5).stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {"gpus": [], "disk": disk}
-    gpus = []
-    for line in out.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 8:
-            continue
-
-        def num(v):
-            try:
-                return float(v)
-            except ValueError:
-                return None
-        gpus.append({"index": int(parts[0]), "name": parts[1], "util": num(parts[2]), "mem_used": num(parts[3]),
-                     "mem_total": num(parts[4]), "temp": num(parts[5]), "power": num(parts[6]),
-                     "power_limit": num(parts[7])})
-    return {"gpus": gpus, "disk": disk}
+    return {"gpus": gpu_status(), "disk": {"free": disk.free, "total": disk.total}}
 
 
 # --------------------------------------------------------------------------- datasets
@@ -1335,7 +1490,11 @@ async def generate(request: Request):
         if not src.exists():
             raise HTTPException(400, "The source image is gone; upload it again")
         req.update(image=str(src), image_id=src.name)
-    return {"id": gen_manager.submit(req)}
+    want = str(body.get("gpu", "auto"))
+    try:
+        return {"id": gen_manager.submit(req, int(want) if want.isdigit() else "auto")}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/generate/input")
@@ -1369,8 +1528,8 @@ def generate_cancel(rid: str):
 
 
 @app.post("/api/generate/unload")
-def generate_unload():
-    gen_manager.unload()
+def generate_unload(gpu: str = "all"):
+    gen_manager.unload(int(gpu) if gpu.isdigit() else "all")
     return {"ok": True}
 
 
@@ -1390,6 +1549,46 @@ def generation_file(filename: str):
     if not path.exists() or path.suffix not in (".png", ".jpg"):
         raise HTTPException(404)
     return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
+
+
+def generation_prompt(stem: str) -> str:
+    return str(read_json(GENERATIONS / f"{stem}.json", {}).get("prompt", ""))
+
+
+@app.get("/api/generations/prompt/{filename}")
+def generation_prompt_file(filename: str):
+    """Just the positive prompt, as <image name>.txt."""
+    path = safe_file(GENERATIONS, filename)
+    if not path.with_suffix(".json").exists():
+        raise HTTPException(404)
+    return PlainTextResponse(generation_prompt(path.stem),
+                             headers={"Content-Disposition": f'attachment; filename="{path.stem}.txt"'})
+
+
+def _build_generations_zip(names: list[str], prompts: bool) -> tuple[Path, int]:
+    images = [p for p in (safe_file(GENERATIONS, n) for n in names) if p.suffix == ".png" and p.exists()]
+    if not images:
+        raise HTTPException(400, "None of those images exist any more")
+    fd, tmp = tempfile.mkstemp(prefix=".generations-", suffix=".zip", dir=WORKSPACE)
+    with os.fdopen(fd, "wb") as out, zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:  # PNGs don't compress further
+        for img in images:
+            z.write(img, img.name)
+            if prompts:
+                z.writestr(f"{img.stem}.txt", generation_prompt(img.stem))
+    return Path(tmp), len(images)
+
+
+@app.post("/api/generations/zip")
+async def generations_zip(files: str = Form(...), prompts: str = Form("")):
+    """Selected images as a zip, each with its prompt in <image name>.txt when asked. A form post, so the browser
+    downloads it directly however large it is."""
+    try:
+        names = [str(n) for n in json.loads(files)]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Bad selection")
+    tmp, count = await run_in_threadpool(_build_generations_zip, names, prompts == "1")
+    return FileResponse(tmp, media_type="application/zip", filename=f"generations_{count}_images.zip",
+                        background=BackgroundTask(tmp.unlink, missing_ok=True))
 
 
 @app.delete("/api/generations/{filename}")

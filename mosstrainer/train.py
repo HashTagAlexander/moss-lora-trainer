@@ -51,6 +51,8 @@ class Job:
         self.stop = False
         self.status = {"state": "starting", "step": 0, "total_steps": self.cfg["train"]["steps"],
                        "message": "", "pid": os.getpid(), "started_at": time.time()}
+        if os.environ.get("MOSS_GPU"):  # the server's pick; it also pins CUDA_VISIBLE_DEVICES to it
+            self.status["gpu"] = int(os.environ["MOSS_GPU"])
 
     def set(self, **kw):
         self.status.update(kw, updated_at=time.time())

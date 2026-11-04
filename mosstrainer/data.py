@@ -11,6 +11,7 @@ import random
 import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
@@ -22,6 +23,13 @@ from .edits import (EDITS_FILE, dataset_path, edit_row_problem, is_edit_dataset,
 from .model import bucket_sizes, closest_bucket
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def _save_atomic(tensors: dict, path: Path):
+    """Cache files are shared: a job on another GPU may be reading (or writing) the same one right now."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    save_file(tensors, tmp)
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -193,7 +201,7 @@ def cache_latents(items: list[Item], vae, cache_dir: Path, progress=None, encode
     for i, it in enumerate(todo):
         pixels = load_pixels(it.image, it.bucket, it.flip).unsqueeze(0)
         latent = encode_images(vae, pixels)[0].to(torch.bfloat16).cpu()
-        save_file({"latent": latent}, str(it.latent_path))
+        _save_atomic({"latent": latent}, it.latent_path)
         if progress:
             progress(i + 1, len(todo))
     return len(todo)
@@ -218,7 +226,7 @@ class TextCache:
     def fill(self, encoder, prompts, progress=None):
         todo = self.missing(prompts)
         for i, p in enumerate(todo):
-            save_file({"embeds": encoder.encode(p).contiguous()}, str(self.path(p)))
+            _save_atomic({"embeds": encoder.encode(p).contiguous()}, self.path(p))
             if progress:
                 progress(i + 1, len(todo))
         return len(todo)
@@ -326,7 +334,7 @@ def cache_edit_embeds(items: list[EditItem], backend, encoder, progress=None, ne
         if backend.edit_null_with_images:
             key, text = ("neg_embeds", negative) if it.target is None else ("null_embeds", "")
             tensors[key] = encoder.encode(text, images=thumbs).contiguous()
-        save_file(tensors, str(it.emb_path))
+        _save_atomic(tensors, it.emb_path)
         if progress:
             progress(i + 1, len(todo))
     return len(todo)
@@ -347,7 +355,7 @@ def cache_edit_latents(items: list[EditItem], backend, vae, progress=None) -> in
         if it.target is not None:
             x0 = backend.encode_images(vae, backend.edit_target(load_rgb(it.target), w, h))
             tensors["x0"] = x0[0].float().cpu().contiguous()
-        save_file(tensors, str(it.lat_path))
+        _save_atomic(tensors, it.lat_path)
         if progress:
             progress(i + 1, len(todo))
     return len(todo)

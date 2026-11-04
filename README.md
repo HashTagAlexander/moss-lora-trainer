@@ -18,6 +18,7 @@ with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
 |---|---|---|---|
 | `OpenMOSS-Team/MOSS-Image-Base` | MOSS-Image | ✓ | recommended MOSS base for LoRAs |
 | `OpenMOSS-Team/MOSS-Image-SFT` | MOSS-Image | ✓ | |
+| `lodestones/Kromoss` | MOSS-Image | ✓ | [full fine-tune](https://huggingface.co/lodestones/Kromoss) of MOSS-Image Base, same architecture and sampling (about 27 GB download). LoRAs load in ComfyUI like other MOSS-Image LoRAs |
 | `kroma-v0.3-teacher` | Krea 2 | ✓ | [lodestones/Kroma](https://huggingface.co/lodestones/Kroma) teacher (velocity), recommended Kroma base for LoRAs |
 | `kroma-v0.3-base` | Krea 2 | ✓ | stored in fp32 (~51 GB download), loaded as bf16 |
 | `kroma-v0.3.1-turbo` | Krea 2 | generate only | 8 steps, CFG 1, shift 1.15. LoRAs trained on the teacher work on it |
@@ -173,6 +174,34 @@ noise / Low noise) skews any timestep type toward noisier steps (composition, li
 detail), the way ai-toolkit does; **Sigmoid** is ai-toolkit's timestep type centred on the middle noise levels.
 With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 25% more speed.
 
+## Multiple GPUs
+
+With two or more GPUs, a **GPU** picker appears in the job form and on the Generate tab (numbers are `nvidia-smi`'s;
+each process is pinned with `CUDA_VISIBLE_DEVICES`). One job or generation still uses one GPU; there is no
+splitting a single job across GPUs.
+
+- **Training**: each GPU trains one job at a time, so you can run a job per GPU side by side. **Auto** takes a free GPU
+  with the most free memory; a job set to a busy GPU waits in the queue for that GPU.
+- **Generating**: each GPU keeps its own model loaded, so they generate side by side and stay loaded when you switch
+  between them. **Auto** prefers a GPU that isn't training or generating, then one that already has the model loaded,
+  then the most free memory. Generating on a GPU that is also training keeps working, with the text encoder off the GPU.
+- If the server was started with `CUDA_VISIBLE_DEVICES` set (numeric), only those GPUs are offered.
+
+## Edit Pairs app (macOS)
+
+`tools/EditPairs` is a small Mac app for building edit-pair datasets. Drop source (control) images on one side and
+targets on the other, many at once; they pair up by file name when names match (`cat.jpg` ↔ `cat.png`), otherwise in
+name order. Each pair can also take up to 4 sources and its own caption; pairs without one use the **universal
+caption** ("turn this image to black and white"). **Export .zip** writes `edits.jsonl`, `src/`, `tgt/` and a `.txt`
+per target, ready to drop on an **Edit pairs** dataset (HEIC, TIFF and GIF are converted to PNG). Build it once with
+Xcode or the Swift command line tools installed:
+
+```bash
+tools/EditPairs/make_app.sh
+```
+
+then open `tools/EditPairs/Edit Pairs.app` (or move it to Applications).
+
 ## Using the LoRA
 
 - **Generate tab** (built in): stack any of your checkpoints (or uploaded `.safetensors` LoRAs) with
@@ -180,6 +209,9 @@ With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 2
   loaded between generations and is unloaded after 15 idle minutes or with **Unload**. Each checkpoint
   row has a **Generate** button that pre-fills its LoRA and trigger word. Images and their settings are
   kept in `moss_workspace/generations/`, and **Use these settings** restores any past image's exact settings.
+  Each image can download as the PNG alone, or as the PNG plus a `.txt` of the same name holding just the positive
+  prompt (the browser may ask once to allow two downloads). **Select** lets you pick many (click, shift-click for a
+  range) and download them as one zip, with or without those `.txt` prompts.
 - **ComfyUI**: install the MOSS-Image ComfyUI plugin from the MOSS-Image repo, load the model with its loader, then
   apply the LoRA with a standard `LoraLoaderModelOnly` node.
 - **Diffusers / CLI**:

@@ -58,6 +58,8 @@ MODEL_SPECS = {
         "defaults": _MOSS_DEFAULTS},
     "OpenMOSS-Team/MOSS-Image-SFT": {
         "label": "MOSS-Image SFT", "family": "moss", "trainable": True, "defaults": _MOSS_DEFAULTS},
+    "lodestones/Kromoss": {
+        "label": "Kromoss (MOSS-Image fine-tune)", "family": "moss", "trainable": True, "defaults": _MOSS_DEFAULTS},
     "kroma-v0.3-teacher": {
         "label": "Kroma v0.3 teacher (Krea 2, recommended for LoRA)", "family": "krea2", "trainable": True,
         "repo": _KROMA, "file": "kroma-sensei-booru-e6-teacher-velocity-v0.3.safetensors",
@@ -129,6 +131,7 @@ DEFAULTS = {
         "mask_floor": 0.1,             # weight of the masked-out area (0 = ignore it entirely)
     },
     "train": {
+        "gpu": "auto",                 # "auto" (a free one) or an nvidia-smi index; the server pins the trainer to it
         "steps": 2000,
         "batch_size": 1,
         "grad_accum": 1,
@@ -222,6 +225,10 @@ def validate(cfg: dict) -> dict:
         raise ValueError("Name may only contain letters, digits, '.', '_' and '-'.")
     if not cfg["dataset"]:
         raise ValueError("Pick a dataset.")
+    gpu = str(cfg["train"].get("gpu", "auto")).strip().lower()
+    if gpu != "auto" and not gpu.isdigit():
+        raise ValueError("GPU must be auto or a GPU number.")
+    cfg["train"]["gpu"] = "auto" if gpu == "auto" else int(gpu)
     res = cfg["data"]["resolutions"]
     if isinstance(res, (int, str)):
         res = [res]
