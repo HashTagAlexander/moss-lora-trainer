@@ -1120,6 +1120,7 @@ async function pageGenerate(params) {
   const defaults = { prompt: "", negative: "", loras: [], aspect: "1:1", mp: 1, width: 1024, height: 1024, steps: 50,
     cfg: 3, seed: -1, count: 1, shift: 5, skip_layer: 22, model: INFO.defaults.model, image: "", gpu: "auto" };
   const st = { ...defaults, ...loadGenState() };
+  GenExtras.defaults(st);
   st.loras = (st.loras || []).filter((l) => loras.some((x) => x.id === l.id));
   if (params.lora) {
     const info = loras.find((x) => x.id === params.lora);
@@ -1142,11 +1143,13 @@ async function pageGenerate(params) {
         <label class="field">Negative prompt<textarea id="g-negative" rows="2" placeholder="Optional, e.g. worst quality, bad anatomy, watermark"></textarea></label>
         <div class="field" id="g-src-field" hidden><div class="row" style="justify-content:space-between"><span>Source image <span class="help">optional: edit this image</span></span>
           <label class="btn btn-sm btn-ghost" style="cursor:pointer">${I.upload} Upload<input type="file" id="g-src-file" accept="image/*" hidden></label></div>
-          <div id="g-src"></div></div>
+          <div id="g-src"></div><div id="g-inpaint" class="extras-body" hidden></div></div>
         <div class="field"><div class="row" style="justify-content:space-between"><span>LoRAs</span>
           <label class="btn btn-sm btn-ghost" style="cursor:pointer" title="Upload a .safetensors LoRA">${I.upload} Upload<input type="file" id="g-upload" accept=".safetensors" multiple hidden></label></div>
           <div id="g-loras" class="lora-list"></div>
           <select id="g-add"></select></div>
+        <details id="g-control" hidden></details>
+        <details id="g-regions" hidden></details>
         <div class="field">Size
           <div class="chips" id="g-aspects">${ASPECTS.map(([k]) => `<span class="chip" data-aspect="${k}">${k}</span>`).join("")}</div>
           <div class="row" style="gap:8px;margin-top:4px;flex-wrap:nowrap">
@@ -1190,6 +1193,7 @@ async function pageGenerate(params) {
     if (k === "width" || k === "height") { st.aspect = ""; syncAspect(); }
     if (k === "mp") applyAspect();
     saveGenState(st);
+    if (k === "width" || k === "height" || k === "mp") extras.refresh();
   });
   const family = () => (INFO.model_specs[st.model] || {}).family;
   $("#g-model").onchange = (e) => {
@@ -1200,7 +1204,7 @@ async function pageGenerate(params) {
     const prevNeg = ((INFO.model_specs[prevModel] || {}).defaults || {}).negative || "";
     if (st.negative === prevNeg) { st.negative = d.negative || ""; $("#g-negative").value = st.negative; }
     prevModel = st.model;
-    saveGenState(st); renderLoras(); renderModelBadge(); renderSource();
+    saveGenState(st); renderLoras(); renderModelBadge(); renderSource(); extras.refresh();
     toast("Loaded the recommended settings for this model", "ok");
   };
   let prevModel = st.model;
@@ -1214,11 +1218,12 @@ async function pageGenerate(params) {
       ? (st.image ? "The edit instruction, e.g. “Make the jacket red leather”… (⌘/Ctrl + Enter)" : fibo ? "Describe the image, or paste a VGL JSON caption… (⌘/Ctrl + Enter)" : "Describe the image… (⌘/Ctrl + Enter to generate)")
       : "Describe the image… (⌘/Ctrl + Enter to generate)";
     $("#g-src").innerHTML = st.image
-      ? `<div class="src-img"><img src="/api/generations/input/${enc(st.image)}"><button class="btn btn-sm" id="g-src-remove" title="Remove">${I.x}</button></div>
+      ? `<div class="src-img"><img src="/api/generations/input/${enc(st.image)}">${st.mask && family() === "krea2" ? `<img class="src-mask" src="/api/generations/input/${enc(st.mask)}" alt="">` : ""}<button class="btn btn-sm" id="g-src-remove" title="Remove">${I.x}</button></div>
          <div class="help" style="margin-top:4px">The result keeps the source's aspect ratio at about the size set below.${fibo ? (fiboTurbo ? "" : " Edit Turbo does this in 4 steps.") : " Krea 2 edits need an edit LoRA (trained here or ostris-style); the base model doesn't know reference images."}</div>`
       : `<div class="faint" style="font-size:12px">None: text-to-image${fiboTurbo ? ". Edit Turbo is made for editing; text-to-image works best on Fibo 2.0 Dev." : ""}</div>`;
   }
   renderSource();
+  const extras = GenExtras.mount({ st, save: () => saveGenState(st), krea: () => family() === "krea2", onSource: renderSource });
   $("#g-vgl").onclick = async () => {
     const out = await VGL.open({ prompt: st.prompt, width: st.width, height: st.height });
     if (out == null) return;
@@ -1230,15 +1235,15 @@ async function pageGenerate(params) {
     const fd = new FormData();
     fd.append("file", f);
     const r = await guard(() => api("/api/generate/input", { method: "POST", body: fd }));
-    st.image = r.id; saveGenState(st); renderSource();
+    st.image = r.id; st.mask = ""; saveGenState(st); renderSource(); extras.refresh();
     e.target.value = "";
   };
-  $("#g-src").onclick = (e) => { if (e.target.closest("#g-src-remove")) { st.image = ""; saveGenState(st); renderSource(); } };
-  $("#g-mp").onchange = (e) => { st.mp = +e.target.value; applyAspect(); saveGenState(st); };
+  $("#g-src").onclick = (e) => { if (e.target.closest("#g-src-remove")) { st.image = st.mask = ""; saveGenState(st); renderSource(); extras.refresh(); } };
+  $("#g-mp").onchange = (e) => { st.mp = +e.target.value; applyAspect(); saveGenState(st); extras.refresh(); };
   $("#g-aspects").onclick = (e) => {
     const c = e.target.closest("[data-aspect]");
     if (!c) return;
-    st.aspect = c.dataset.aspect; syncAspect(); applyAspect(); saveGenState(st);
+    st.aspect = c.dataset.aspect; syncAspect(); applyAspect(); saveGenState(st); extras.refresh();
   };
   $("#g-random").onclick = (e) => { e.preventDefault(); st.seed = -1; $("#g-seed").value = -1; saveGenState(st); };
 
@@ -1303,7 +1308,8 @@ async function pageGenerate(params) {
 
   // ---- submit
   async function submit() {
-    const body = { ...st, loras: st.loras.map((l) => ({ id: l.id, strength: l.strength, name: loraInfo(l.id).label })) };
+    const body = { ...st, loras: st.loras.map((l) => ({ id: l.id, strength: l.strength, name: loraInfo(l.id).label })),
+      ...GenExtras.body(st, family() === "krea2") };
     if (!(INFO.model_specs[st.model] || {}).edit) delete body.image;
     await guard(() => api("/api/generate", { method: "POST", body }));
     refreshStatus();
@@ -1365,7 +1371,8 @@ async function pageGenerate(params) {
   // ---- gallery
   let items = [], lastVersion = null, limit = 60;
   const fileUrl = (f) => `/api/generations/file/${enc(f)}`;
-  const describe = (it) => [...(it.image_id ? ["edit"] : []), `seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
+  const describe = (it) => [...(it.inpaint ? ["inpaint"] : it.image_id ? ["edit"] : []), ...(it.control ? [`${it.control.type} control`] : []),
+    ...(it.regions ? [`${it.regions.length} region${it.regions.length > 1 ? "s" : ""}`] : []), `seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
     ...(it.loras || []).map((l) => `${l.name} @ ${l.strength}`)].join(" · ");
   // selecting: click cards to pick them (shift-click for a range), then download them together
   let selecting = false, anchor = null, withPrompts = true;
@@ -1455,10 +1462,13 @@ async function pageGenerate(params) {
       const it = items[+reuse.dataset.reuse];
       Object.assign(st, { prompt: it.prompt, negative: it.negative || "", width: it.width, height: it.height, steps: it.steps,
         cfg: it.cfg, shift: it.shift ?? 5, skip_layer: it.skip_layer ?? 22, seed: it.seed, model: it.model || st.model, aspect: "", image: it.image_id || "",
-        loras: (it.loras || []).filter((l) => loras.some((x) => x.id === l.path)).map((l) => ({ id: l.path, strength: l.strength })) });
+        loras: (it.loras || []).filter((l) => loras.some((x) => x.id === l.path)).map((l) => ({ id: l.path, strength: l.strength })),
+        mask: it.inpaint ? it.inpaint.mask : "", regions: (it.regions || []).map((r) => ({ ...r })),
+        inpaint: { ...st.inpaint, ...(it.inpaint ? { mode: it.inpaint.lora ? "lora" : "blend", strength: it.inpaint.strength ?? 1 } : {}) },
+        control: it.control ? { type: it.control.type, image: it.control.image, photo: "", strength: it.control.strength ?? 1 } : { ...st.control, type: "" } });
       saveGenState(st);
       for (const [k, sel] of Object.entries(fields)) if (k !== "mp") $(sel).value = st[k];
-      syncAspect(); renderLoras(); renderSource(); renderModelBadge(); prevModel = st.model;
+      syncAspect(); renderLoras(); renderSource(); renderModelBadge(); extras.refresh(); prevModel = st.model;
       window.scrollTo({ top: 0, behavior: "smooth" });
       toast("Settings loaded (same seed)", "ok");
     }

@@ -285,6 +285,27 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .src-img img { max-width: 100%; max-height: 160px; border-radius: 8px; border: 1px solid var(--border); display: block; }
 .src-img .btn { position: absolute; top: 6px; right: 6px; padding: 4px; background: rgba(10, 12, 16, .85); }
 
+.src-img .src-mask { position: absolute; inset: 0; width: 100%; height: 100%; max-height: none; border: 0; mix-blend-mode: screen; opacity: .6; pointer-events: none; }
+
+/* ---------- generate extras: inpainting, control image, regions ---------- */
+.extras-body { display: grid; gap: 8px; margin-top: 8px; }
+.gen-form details .extras-body { margin-top: 10px; }
+.addon { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px 6px 10px; font-size: 12.5px; min-height: 36px; }
+.addon-ok { color: var(--green); display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+.addon-ok svg { width: 13px; height: 13px; }
+.region-pad { position: relative; width: 100%; max-height: 320px; margin: 0 auto; background: var(--bg) center / 100% 100% no-repeat; border: 1px dashed var(--border-2); border-radius: 8px; overflow: hidden; cursor: crosshair; touch-action: none; user-select: none; }
+.region-box { position: absolute; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 22%, transparent); border-radius: 4px; cursor: move; }
+.region-box span, .region-dot { display: inline-grid; place-items: center; min-width: 18px; height: 18px; border-radius: 4px; background: var(--c); color: #0b0d12; font-size: 11px; font-weight: 700; }
+.region-box span { position: absolute; top: 2px; left: 2px; pointer-events: none; }
+.region-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) 28px; gap: 6px; align-items: start; }
+.region-row .region-dot { margin-top: 6px; }
+.region-row .btn { padding: 4px; justify-content: center; }
+.modal.mask-editor { max-width: 860px; max-height: calc(100vh - 32px); overflow: auto; }
+.mask-stage { position: relative; display: block; width: fit-content; max-width: 100%; margin: 0 auto; line-height: 0; }
+.mask-stage img { display: block; max-width: 100%; max-height: 62vh; border-radius: 8px; }
+.mask-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .55; cursor: crosshair; touch-action: none; }
+.mask-tools { gap: 10px; margin-top: 12px; }
+
 /* ---------- VGL editor / layout ---------- */
 .modal.vgl-editor, .vgl-editor { width: 100%; max-width: 1180px; max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
 .vgl-tabs { margin: 0; border: 0; }

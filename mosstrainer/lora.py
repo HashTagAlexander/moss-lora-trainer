@@ -256,8 +256,8 @@ def _strip_prefix(name: str) -> str:
 
 
 def read_lora_file(path) -> dict[str, tuple[str, torch.Tensor, torch.Tensor, float]]:
-    """Return {module_name: ("lora", A, B, scale) | ("lokr", w1, w2, scale)} for lora_A/lora_B, lora_down/lora_up
-    and LyCORIS LoKr files (full or low-rank factors)."""
+    """Return {module_name: ("lora", A, B, scale) | ("lokr", w1, w2, scale)} for lora_A/lora_B, lora_down/lora_up,
+    bare A/B (Krea 2 control-LoRAs) and LyCORIS LoKr files (full or low-rank factors)."""
     sd = load_file(str(path))
     peft_alpha = _peft_alpha(path)
     out = {}
@@ -280,7 +280,7 @@ def read_lora_file(path) -> dict[str, tuple[str, torch.Tensor, torch.Tensor, flo
             scale = float(alpha) / dim if alpha is not None and dim else 1.0  # ComfyUI's rule
             out[_strip_prefix(name)] = ("lokr", w1, w2, scale)
             continue
-        for down, up in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight")):
+        for down, up in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight"), (".A", ".B")):
             if not key.endswith(down):
                 continue
             name = key[:-len(down)]
@@ -295,6 +295,19 @@ def read_lora_file(path) -> dict[str, tuple[str, torch.Tensor, torch.Tensor, flo
             scale = (float(alpha) / rank) if alpha is not None else 1.0
             out[_strip_prefix(name)] = ("lora", a, b, scale)
     return out
+
+
+def read_control_input(path) -> torch.Tensor | None:
+    """The control half of a control-LoRA's widened input layer: `first.weight` is [hidden, 2 * C] (the picture's
+    channels, then the control image's); returns [hidden, C], or None for an ordinary LoRA file."""
+    from safetensors import safe_open
+    with safe_open(str(path), "pt", device="cpu") as f:
+        for key in f.keys():
+            if key.endswith(("first.weight", "img_in.weight")):
+                weight = f.get_tensor(key)
+                if weight.ndim == 2 and weight.shape[1] % 2 == 0:
+                    return weight[:, weight.shape[1] // 2:].clone()
+    return None
 
 
 class DynamicLoRALinear(nn.Module):

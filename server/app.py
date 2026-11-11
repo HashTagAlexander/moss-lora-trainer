@@ -33,7 +33,7 @@ from starlette.background import BackgroundTask
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from mosstrainer import captioner  # noqa: E402
+from mosstrainer import addons, captioner  # noqa: E402
 from mosstrainer.edits import (EDITS_FILE, caption_file, dataset_path, edit_row_problem,  # noqa: E402
                                is_edit_dataset, read_edit_rows, write_edit_rows)
 from mosstrainer.config import (DEFAULTS, FAMILY_TARGETS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE,  # noqa: E402
@@ -565,7 +565,8 @@ class DownloadManager:
     def _slug(model: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]", "_", model)
 
-    def start(self, model: str):
+    def start(self, model: str, addon: str | None = None):
+        """`model` names the download; with `addon`, it fetches that Generate-tab add-on instead of a base model."""
         with self.lock:
             p = self.procs.get(model)
             if p and p.poll() is None:
@@ -574,8 +575,10 @@ class DownloadManager:
             (DOWNLOADS / f"{slug}.ok").unlink(missing_ok=True)
             log = open(DOWNLOADS / f"{slug}.log", "w")
             code = "import sys; from mosstrainer.backends import prefetch; print('Done:', prefetch(sys.argv[1]))"
+            if addon:
+                code = "import sys; from mosstrainer.addons import fetch; print('Done:', *fetch(sys.argv[1]))"
             self.procs[model] = subprocess.Popen(
-                [sys.executable, "-c", code, model], cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+                [sys.executable, "-c", code, addon or model], cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
 
     def status(self, model: str) -> dict:
@@ -1490,6 +1493,10 @@ async def generate(request: Request):
         if not src.exists():
             raise HTTPException(400, "The source image is gone; upload it again")
         req.update(image=str(src), image_id=src.name)
+    try:
+        req.update(generate_extras(body, MODEL_SPECS[model]["family"]))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(400, "Invalid inpaint, control or region settings")
     want = str(body.get("gpu", "auto"))
     try:
         return {"id": gen_manager.submit(req, int(want) if want.isdigit() else "auto")}
@@ -1497,9 +1504,112 @@ async def generate(request: Request):
         raise HTTPException(400, str(e))
 
 
+def _input_or_400(name, what: str) -> Path:
+    path = safe_file(INPUTS, str(name or ""))
+    if not name or not path.is_file():
+        raise HTTPException(400, f"The {what} is gone; add it again")
+    return path
+
+
+def generate_extras(body: dict, family: str) -> dict:
+    """The Generate tab's inpainting, control image and regional prompts (Krea 2 / Kroma), checked and with the
+    add-on files they need resolved, in the shape mosstrainer.generate_worker reads."""
+    inpaint, control, regions = body.get("inpaint"), body.get("control"), body.get("regions") or []
+    if not (inpaint or control or regions):
+        return {}
+    if family != "krea2":
+        raise HTTPException(400, "Inpainting, control images and regions work with Krea 2 and Kroma models only")
+    out = {}
+
+    def strength(item):
+        return max(0.0, min(2.0, float(item.get("strength", 1.0))))
+
+    if inpaint:
+        if not body.get("image"):
+            raise HTTPException(400, "Inpainting needs a source image")
+        out["inpaint"] = {"mask": str(_input_or_400(inpaint.get("mask"), "mask")), "keep": bool(inpaint.get("keep", True))}
+        if inpaint.get("mode", "lora") == "lora":
+            path = addons.lora_path("inpaint")
+            if not path:
+                raise HTTPException(400, "Download the inpaint LoRA first, or switch inpainting to “No LoRA”")
+            out["inpaint"].update(lora=str(path), strength=strength(inpaint), ref=addons.ADDONS["inpaint"]["ref"])
+    if control:
+        kind = control.get("type")
+        if kind not in ("depth", "pose", "canny"):
+            raise HTTPException(400, "Unknown control type")
+        if kind != "depth" and body.get("image"):
+            raise HTTPException(400, f"{kind.capitalize()} control uses the reference image itself, so it can't be "
+                                     "combined with a source image. Remove one of them (depth control can).")
+        path = addons.lora_path(kind)
+        if not path:
+            raise HTTPException(400, f"Download the {kind} control LoRA first")
+        out["control"] = {"type": kind, "image": str(_input_or_400(control.get("image"), "control image")),
+                          "lora": str(path), "strength": strength(control), "ref": addons.ADDONS[kind].get("ref")}
+    boxes = []
+    for r in regions[:8]:
+        x, y = max(0.0, min(1.0, float(r["x"]))), max(0.0, min(1.0, float(r["y"])))
+        w, h = min(1.0 - x, float(r["w"])), min(1.0 - y, float(r["h"]))
+        text = str(r.get("prompt", "")).strip()
+        if text and w > 0 and h > 0:
+            boxes.append({"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4), "prompt": text})
+    if boxes:
+        out["regions"] = boxes
+    return out
+
+
+def addon_status(addon: str) -> dict:
+    spec = addons.ADDONS[addon]
+    here = bool(addons.paths(addon))
+    st = {"state": "done", "message": ""} if here else downloads.status(f"addon:{addon}")
+    if st["state"] == "done" and not here:  # downloaded once, then removed from the cache
+        st = {"state": "none", "message": ""}
+    return {"id": addon, "label": spec["label"], "by": spec["by"], "size": spec["size"], "license": spec["license"],
+            "about": spec["about"], "url": addons.url(addon), **st}
+
+
+@app.get("/api/addons")
+def list_addons():
+    return [addon_status(a) for a in addons.ADDONS]
+
+
+@app.post("/api/addons/download")
+async def download_addon(request: Request):
+    addon = (await request.json()).get("id")
+    if addon not in addons.ADDONS:
+        raise HTTPException(400, "Unknown add-on")
+    if not addons.paths(addon):
+        downloads.start(f"addon:{addon}", addon=addon)
+    return addon_status(addon)
+
+
+@app.post("/api/generate/preprocess")
+async def preprocess_input(request: Request):
+    """Make a control map (depth, pose or canny) from an uploaded picture; the map lands beside it."""
+    body = await request.json()
+    kind = body.get("type")
+    if kind not in ("depth", "pose", "canny"):
+        raise HTTPException(400, "Unknown control type")
+    src = _input_or_400(body.get("image"), "picture")
+    if kind != "canny" and not addons.paths(f"{kind}-estimator"):
+        raise HTTPException(400, f"Download the {kind} estimator first, or upload a ready-made {kind} map")
+    target = _unique(INPUTS, f"{src.stem}-{kind}.png")
+    gpus = gpu_list()
+    cmd = [sys.executable, "-m", "mosstrainer.preprocess", "--type", kind, "--image", str(src), "--out", str(target)]
+    try:
+        proc = await run_in_threadpool(lambda: subprocess.run(
+            cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=900,
+            env=gpu_env(max(gpus, key=free_memory)["index"] if gpus else None)))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "Making the map took too long")
+    if proc.returncode or not target.is_file():
+        lines = [ln for ln in (proc.stderr or "").strip().splitlines() if ln.strip()]
+        raise HTTPException(400, lines[-1][:300] if lines else "Couldn't make the map")
+    return {"id": target.name}
+
+
 @app.post("/api/generate/input")
 async def upload_input(file: UploadFile = File(...)):
-    """A source image for editing (Fibo 2.0)."""
+    """A picture for the Generate tab: a source image to edit, an inpainting mask or a control image."""
     name = _clean_name(file.filename or "image.png")
     if Path(name).suffix not in IMAGE_EXTS:
         raise HTTPException(400, "Upload an image")

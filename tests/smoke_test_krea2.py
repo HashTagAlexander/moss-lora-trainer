@@ -7,6 +7,8 @@ Checks, against diffusers' own Krea2Pipeline:
   * original-format (Kroma/ComfyUI) checkpoint conversion + loading,
   * our sampler == Krea2Pipeline denoising for the same start latents (CFG convention included),
   * saved LoRAs load with diffusers' Krea2 LoRA loader and give the same output as our runtime stack,
+  * the Generate tab's extras against independent formulations: in-context references, isolated references
+    (== a K/V cache pass), a control-LoRA's input (== a widened first layer), regional prompts and inpainting,
 then runs the real trainer process (caching, training, sampling, saving, resume).
 """
 import json
@@ -158,6 +160,103 @@ def check_against_diffusers(tmp: Path):
     assert torch.allclose(stacked, injected, atol=1e-4) and torch.allclose(diff, injected, atol=1e-4)
 
 
+def check_extras(tmp: Path):
+    """Inpainting, control images and regional prompts (Krea2Backend._forward_ctx), each against another way of
+    computing the same thing."""
+    import copy
+
+    import torch.nn.functional as Fn
+    from diffusers.models.transformers.transformer_krea2 import apply_rotary_emb
+    from mosstrainer.backends import get_backend
+    be = get_backend("tiny-krea2")
+    model = be.load_transformer("cpu").float()
+    g = torch.Generator().manual_seed(1)
+
+    def rn(*shape):
+        return torch.randn(*shape, generator=g)
+
+    gh, gw, n_txt = 8, 12, 7
+    x, ref, sig = rn(1, 16, 16, 24), rn(1, 16, 16, 24), torch.tensor([0.6])
+    txt, tmask = rn(1, n_txt, 12, TD), torch.ones(1, n_txt, dtype=torch.bool)
+    ids = torch.cat([torch.zeros(n_txt, 3), be._grid_ids(gh, gw, 0, "cpu")])
+
+    def kv_cached():
+        """ai-toolkit's kv_cache: the reference alone at t=0, its keys and values reused by the denoising pass."""
+        def embed(t):
+            return model.time_embed(t, dtype=torch.float32)
+
+        def block(blk, h, mod, rope, cached=None, keep=None):
+            ps, psh, pg, qs, qsh, qg = (mod.unflatten(-1, (6, -1)) + blk.scale_shift_table).unbind(-2)
+            a, hin = blk.attn, (1 + ps) * blk.norm1(h) + psh
+            q = apply_rotary_emb(a.norm_q(a.to_q(hin).unflatten(-1, (a.num_heads, a.head_dim))), rope, sequence_dim=1)
+            k = apply_rotary_emb(a.norm_k(a.to_k(hin).unflatten(-1, (a.num_kv_heads, a.head_dim))), rope, sequence_dim=1)
+            v = a.to_v(hin).unflatten(-1, (a.num_kv_heads, a.head_dim))
+            rep = a.num_heads // a.num_kv_heads
+            q, k, v = q.transpose(1, 2), k.repeat_interleave(rep, 2).transpose(1, 2), v.repeat_interleave(rep, 2).transpose(1, 2)
+            if keep is not None:
+                keep.append((k, v))
+            if cached is not None:
+                k, v = torch.cat([k, cached[0]], 2), torch.cat([v, cached[1]], 2)
+            out = Fn.scaled_dot_product_attention(q, k, v).transpose(1, 2).flatten(2, 3)
+            h = h + pg * a.to_out[0](out * torch.sigmoid(a.to_gate(hin)))
+            return h + qg * blk.ff((1 + qs) * blk.norm2(h) + qsh)
+
+        mod = model.time_mod_proj(Fn.gelu(embed(sig), approximate="tanh"))
+        mod0 = model.time_mod_proj(Fn.gelu(embed(torch.zeros_like(sig)), approximate="tanh"))
+        h, cache = model.img_in(be._pack(ref)), []
+        for blk in model.transformer_blocks:
+            h = block(blk, h, mod0, model.rotary_emb(be._grid_ids(gh, gw, 1, "cpu")), keep=cache)
+        h = torch.cat([model.txt_in(model.text_fusion(txt)), model.img_in(be._pack(x))], 1)
+        for blk, kv in zip(model.transformer_blocks, cache):
+            h = block(blk, h, mod, model.rotary_emb(ids), cached=kv)
+        return be._unpack(model.final_layer(h[:, n_txt:], embed(sig)), 16, 24)
+
+    with torch.no_grad():
+        stock = be.predict(model, x, sig, txt, tmask)
+        # a plain in-context reference == the stock model over [target | reference], the reference on frame 1
+        both = torch.cat([ids, be._grid_ids(gh, gw, 1, "cpu")])
+        want = model(hidden_states=torch.cat([be._pack(x), be._pack(ref)], 1), encoder_hidden_states=txt, timestep=sig,
+                     position_ids=both, return_dict=False)[0][:, :gh * gw]
+        plain = be.predict(model, x, sig, txt, tmask, context={"refs": [ref], "ref_t0": False})
+        assert torch.allclose(plain, be._unpack(want, 16, 24), atol=1e-5), "in-context reference"
+        # isolated references == the K/V cache pass
+        iso = be.predict(model, x, sig, txt, tmask, context={"refs": [ref], "isolate": True})
+        d_iso = (iso - kv_cached()).abs().max().item()
+        assert d_iso < 1e-5 and (iso - be.predict(model, x, sig, txt, tmask, context=[ref])).abs().max() > 1e-6
+        # a control-LoRA's input == its widened first layer [base | control] on concatenated tokens
+        ctrl, wc = be._pack(rn(1, 16, 16, 24)), rn(F, 64) * 0.05
+        wide = copy.deepcopy(model)
+        wide.img_in = torch.nn.Linear(128, F)
+        wide.img_in.weight.data = torch.cat([model.img_in.weight.data, wc], 1)
+        wide.img_in.bias.data = model.img_in.bias.data.clone()
+        want = wide(hidden_states=torch.cat([be._pack(x), ctrl], -1), encoder_hidden_states=txt, timestep=sig,
+                    position_ids=ids, return_dict=False)[0]
+        out = be.predict(model, x, sig, txt, tmask, context={"control": (ctrl, wc)})
+        d_ctrl = (out - be._unpack(want, 16, 24)).abs().max().item()
+        assert d_ctrl < 1e-5 and (out - stock).abs().max() > 1e-6
+        # regions: after one block, a region's prompt has reached its own image tokens and nothing else
+        boxes = [{"x": 0, "y": 0, "w": 0.5, "h": 1}, {"x": 0.5, "y": 0, "w": 0.5, "h": 1}]
+        left, right = be.region_tokens(boxes, 24 * 8, 16 * 8)
+        assert left.view(gh, gw)[:, :6].all() and not left.view(gh, gw)[:, 6:].any() and (left ^ right).all()
+        ra, seen = rn(5, 12, TD), []
+        hook = model.transformer_blocks[0].register_forward_hook(lambda m, i, o: seen.append(o[0, n_txt + 5 + 6:]))
+        for rb in (rn(6, 12, TD), rn(6, 12, TD)):
+            be.predict(model, x, sig, txt, tmask, context={"regions": [(ra, left), (rb, right)]})
+        hook.remove()
+        moved = (seen[0] - seen[1]).abs()
+        assert moved[left].max() < 1e-7 and moved[right].max() > 1e-6, "regional prompt leaked"
+    # inpainting without a LoRA: what the mask leaves alone comes back as the source's latents exactly
+    vae = be.load_vae("cpu")
+    known, mask = rn(1, 16, 16, 24), torch.zeros(1, 1, 16, 24)
+    mask[..., 12:] = 1
+    lat = be.sample(model, vae, rn(7, 12, TD).to(torch.bfloat16), rn(4, 12, TD).to(torch.bfloat16), width=192, height=128,
+                    steps=3, cfg=2.0, seed=5, shift=0.0, skip_layer=-1, device="cpu", output="latent",
+                    inpaint=(known, mask), context={"regions": [(ra, left)]})
+    assert torch.allclose(lat[..., :12], known[..., :12], atol=1e-5) and not torch.allclose(lat[..., 12:], known[..., 12:], atol=1e-2)
+    print(f"extras: isolated refs vs K/V cache {d_iso:.1e} | control input vs widened layer {d_ctrl:.1e} | "
+          "in-context, regions and inpainting OK")
+
+
 def run_trainer(tmp: Path):
     ws = tmp / "workspace"
     ds = ws / "datasets" / "toy"
@@ -220,6 +319,7 @@ def main():
         tmp = Path(d)
         build(tmp)
         check_against_diffusers(tmp)
+        check_extras(tmp)
         run_trainer(tmp)
         run_worker(tmp)
         print("KREA2 SMOKE TEST PASSED")

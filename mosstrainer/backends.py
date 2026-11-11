@@ -372,49 +372,118 @@ class Krea2Backend(Backend):
         return ids
 
     def predict(self, model, x, sigma, embeds, mask, context=None):
+        """`context`: nothing, the source latents of an edit (ostris' contract), or a dict of the extras
+        `_forward_ctx` knows (reference modes, a control-LoRA's input, regional prompts)."""
         _, _, h, w = x.shape
         gh, gw = h // self.patch, w // self.patch
-        text_len = embeds.shape[1]
-        ids = torch.cat([torch.zeros(text_len, 3, device=x.device), self._grid_ids(gh, gw, 0, x.device)])
         dtype = torch.bfloat16 if x.device.type == "cuda" else next(model.parameters()).dtype
         enc_mask = None if bool(mask.all()) else mask
         if context:
-            return self._unpack(self._forward_refs(model, self._pack(x).to(dtype), embeds.to(dtype), sigma.to(dtype),
-                                                   ids, enc_mask, context, dtype).float(), h, w)
+            ctx = context if isinstance(context, dict) else {"refs": context}
+            out = self._forward_ctx(model, self._pack(x).to(dtype), embeds.to(dtype), sigma.to(dtype), enc_mask, ctx,
+                                    gh, gw, dtype)
+            return self._unpack(out.float(), h, w)
+        ids = torch.cat([torch.zeros(embeds.shape[1], 3, device=x.device), self._grid_ids(gh, gw, 0, x.device)])
         out = model(hidden_states=self._pack(x).to(dtype), encoder_hidden_states=embeds.to(dtype),
                     timestep=sigma.to(dtype), position_ids=ids, encoder_attention_mask=enc_mask, return_dict=False)[0]
         return self._unpack(out.float(), h, w)
 
-    def _forward_refs(self, model, img, txt, timestep, ids, enc_mask, refs, dtype):
-        """Krea2Transformer2DModel.forward with reference tokens appended after the target: ref i on RoPE frame i+1
-        (own grid from 0) and modulated at t=0, text and target at the noisy t, the prediction covering the target
-        only (ostris' Krea 2 edit). The blocks take per-token modulation as is: theirs just broadcasts (B, 1, 6H)."""
+    def _forward_ctx(self, model, img, txt, timestep, enc_mask, ctx, gh, gw, dtype):
+        """Krea2Transformer2DModel.forward with the extras in `ctx`; the prediction covers the target only.
+          refs     clean reference latents after the target tokens, reference i on RoPE frame i+1 (own grid from 0).
+                   `ref_t0` (default on) modulates them at t=0 and the rest at the noisy t: ostris' Krea 2 edit.
+                   Off, everything shares the noisy t: plain in-context LoRAs (NK2E). The blocks take per-token
+                   modulation as is: theirs just broadcasts (B, 1, 6H).
+                   `isolate` lets references attend only to each other, as LoRAs trained with ai-toolkit's
+                   kv_cache expect (caching their keys and values from a reference-only pass gives the same result).
+          control  (tokens [1, N, C], weight [H, C]): the extra input channels of a control-LoRA, added to the
+                   target's patch embedding. The model's own input layer stays (as comfyui-krea2-controlnet does),
+                   so a fine-tuned base keeps its weights.
+          regions  [(embeds [T, 12, D], tokens bool [N])]: one more prompt per region, after the main prompt.
+                   Prompts don't see each other, a region's prompt and its image tokens see each other, the main
+                   prompt sees the whole image (ComfyUI-Krea2-Regional's mask)."""
         import torch.nn.functional as F
         b, n_img, _ = img.shape
-        ref_tok = [self._pack(r.to(img.device, dtype)) for r in refs]
-        ref_ids = [self._grid_ids(r.shape[-2] // self.patch, r.shape[-1] // self.patch, i + 1, img.device)
-                   for i, r in enumerate(refs)]
-        img = torch.cat([img] + [t.expand(b, -1, -1) for t in ref_tok], 1)
-        ids = torch.cat([ids] + ref_ids)
-        n_ref = img.shape[1] - n_img
+        dev = img.device
+        refs = ctx.get("refs") or []
+        regions = ctx.get("regions") or []
+        ref_tok = [self._pack(r.to(dev, dtype)).expand(b, -1, -1) for r in refs]
+        n_ref = sum(t.shape[1] for t in ref_tok)
         temb = model.time_embed(timestep, dtype=dtype)
         mod = model.time_mod_proj(F.gelu(temb, approximate="tanh"))
-        mod0 = model.time_mod_proj(F.gelu(model.time_embed(torch.zeros_like(timestep), dtype=dtype), approximate="tanh"))
-        text_len = txt.shape[1]
-        mods = torch.cat([mod.expand(b, text_len + n_img, -1), mod0.expand(b, n_ref, -1)], 1)
-        text_mask = attn_mask = None
-        if enc_mask is not None:
-            text_mask = enc_mask[:, None, None, :]
-            attn_mask = torch.cat([enc_mask, enc_mask.new_ones((b, img.shape[1]))], 1)[:, None, None, :]
-        txt = model.txt_in(model.text_fusion(txt, attention_mask=text_mask))
-        hidden = torch.cat([txt, model.img_in(img)], 1)
-        rope = model.rotary_emb(ids)
+
+        # text: every prompt goes through the text fusion on its own
+        text_mask = None if enc_mask is None else enc_mask[:, None, None, :]
+        parts = [model.txt_in(model.text_fusion(txt, attention_mask=text_mask))]
+        for emb, _ in regions:
+            parts.append(model.txt_in(model.text_fusion(emb[None].to(dev, dtype))).expand(b, -1, -1))
+        text = torch.cat(parts, 1)
+        text_len = text.shape[1]
+
+        image = model.img_in(torch.cat([img] + ref_tok, 1))
+        if ctx.get("control") is not None:
+            tokens, weight = ctx["control"]
+            extra = F.linear(tokens.to(dev, image.dtype).expand(b, -1, -1), weight.to(dev, image.dtype))
+            image = torch.cat([image[:, :n_img] + extra, image[:, n_img:]], 1)
+        hidden = torch.cat([text, image], 1)
+        ids = [torch.zeros(text_len, 3, device=dev), self._grid_ids(gh, gw, 0, dev)]
+        ids += [self._grid_ids(r.shape[-2] // self.patch, r.shape[-1] // self.patch, i + 1, dev)
+                for i, r in enumerate(refs)]
+        rope = model.rotary_emb(torch.cat(ids))
+
+        mods = mod
+        if n_ref and ctx.get("ref_t0", True):
+            zero = model.time_embed(torch.zeros_like(timestep), dtype=dtype)
+            mod0 = model.time_mod_proj(F.gelu(zero, approximate="tanh"))
+            mods = torch.cat([mod.expand(b, text_len + n_img, -1), mod0.expand(b, n_ref, -1)], 1)
+
+        attn_mask = None
+        if regions or (n_ref and ctx.get("isolate")):
+            from . import masked_attn
+            masked_attn.install(model)
+            lens = tuple(p.shape[1] for p in parts)
+            cache = ctx.setdefault("_masks", {}) if enc_mask is None else {}  # the same at every step of a generation
+            if lens not in cache:
+                cache[lens] = self._allow_mask(lens, [m for _, m in regions], n_img, n_ref, bool(ctx.get("isolate")),
+                                               enc_mask, dev)[None, None]
+            attn_mask = cache[lens]
+        elif enc_mask is not None:
+            attn_mask = torch.cat([enc_mask, enc_mask.new_ones((b, n_img + n_ref))], 1)[:, None, None, :]
         for block in model.transformer_blocks:
             if torch.is_grad_enabled() and model.gradient_checkpointing:
                 hidden = model._gradient_checkpointing_func(block, hidden, mods, rope, attn_mask)
             else:
                 hidden = block(hidden, mods, rope, attn_mask)
         return model.final_layer(hidden[:, text_len:text_len + n_img], temb)
+
+    @staticmethod
+    def _allow_mask(text_lens, region_tokens, n_img, n_ref, isolate, enc_mask, device):
+        """Who may attend to whom, [L, L] bool over [main prompt | region prompts | target | references]."""
+        text_len = sum(text_lens)
+        i0, r0 = text_len, text_len + n_img
+        allow = torch.ones(r0 + n_ref, r0 + n_ref, dtype=torch.bool, device=device)
+        if region_tokens:
+            allow[:text_len] = False
+            allow[:, :text_len] = False
+            start = 0
+            for k, n in enumerate(text_lens):
+                seg = slice(start, start + n)
+                allow[seg, seg] = True
+                if k == 0:  # the main prompt and the whole image (and references) see each other
+                    allow[seg, i0:] = True
+                    allow[i0:, seg] = True
+                else:
+                    inside = region_tokens[k - 1].to(device)
+                    allow[seg, i0:r0] = inside[None, :]
+                    allow[i0:r0, seg] = inside[:, None]
+                    allow[seg, r0:] = True
+                    allow[r0:, seg] = True
+                start += n
+        if isolate and n_ref:
+            allow[r0:, :r0] = False
+        if enc_mask is not None:  # padding in the main prompt is never a key (one prompt per call here)
+            allow[:, :text_lens[0]] &= enc_mask[0].to(device)[None, :]
+        return allow
 
     # ---- editing (edit LoRAs, Generate tab)
     def edit_size(self, width, height, area):
@@ -462,6 +531,33 @@ class Krea2Backend(Backend):
         crops, thumbs, width, height = self.edit_inputs([image], width * height)
         return [self.encode_images(vae, c) for c in crops], thumbs, width, height
 
+    # ---- inpainting, control images and regional prompts (Generate tab)
+    def region_tokens(self, regions, width, height):
+        """Each region's image tokens: bool [tokens] per {"x", "y", "w", "h"} box in 0-1 of the picture. A token
+        belongs to the box its centre is in; where boxes overlap, the later one wins."""
+        gh, gw = height // (self.vae_scale * self.patch), width // (self.vae_scale * self.patch)
+        ys = ((torch.arange(gh) + 0.5) / gh)[:, None].expand(gh, gw)
+        xs = ((torch.arange(gw) + 0.5) / gw)[None, :].expand(gh, gw)
+        owner = torch.full((gh, gw), -1)
+        for i, r in enumerate(regions):
+            x, y = float(r["x"]), float(r["y"])
+            owner[(xs >= x) & (xs < x + float(r["w"])) & (ys >= y) & (ys < y + float(r["h"]))] = i
+        return [(owner == i).flatten() for i in range(len(regions))]
+
+    def control_tokens(self, vae, image, width, height):
+        """A control image as the target's extra input channels: scaled to cover the result size, VAE-encoded and
+        patchified like the picture itself, [1, tokens, 64]."""
+        return self._pack(self.encode_images(vae, self.edit_target(image, width, height)))
+
+    def inpaint_inputs(self, vae, image, mask):
+        """For inpainting without a LoRA: the source's latents, and the mask on the latent grid (1 where any pixel
+        of the cell is to be repainted). Both already at the result's size; `mask`: mode L, white = repaint."""
+        import torch.nn.functional as F
+        width, height = image.size
+        m = torch.frombuffer(bytearray(mask.convert("L").tobytes()), dtype=torch.uint8).view(1, 1, height, width)
+        return (self.encode_images(vae, self.edit_target(image, width, height)),
+                (F.max_pool2d(m.float() / 255, self.vae_scale) > 0.5).float())
+
     @staticmethod
     def calculate_mu(seq_len, base_seq=256, max_seq=6400, base_shift=0.5, max_shift=1.15):
         m = (max_shift - base_shift) / (max_seq - base_seq)
@@ -469,7 +565,9 @@ class Krea2Backend(Backend):
 
     @torch.no_grad()
     def sample(self, model, vae, pos, neg, *, width, height, steps, cfg, seed, shift, skip_layer, device,
-               progress=None, latents=None, output="pil", context=None):
+               progress=None, latents=None, output="pil", context=None, inpaint=None):
+        """`inpaint`: (source latents [1, 16, h, w], mask [1, 1, h, w] with 1 = repaint). After every step the
+        rest of the picture is put back at that step's noise level, so only the masked part is generated."""
         import numpy as np
         from diffusers import FlowMatchEulerDiscreteScheduler
         from PIL import Image
@@ -482,7 +580,13 @@ class Krea2Backend(Backend):
         gen = torch.Generator("cpu").manual_seed(seed)
         if latents is None:
             latents = torch.randn((1, 16, h, w), generator=gen, dtype=torch.float32)
-        latents = latents.to(device, torch.float32)
+        latents = noise = latents.to(device, torch.float32)
+        if inpaint is not None:
+            known, repaint = (t.to(device, torch.float32) for t in inpaint)
+        # regional prompts belong to the positive prompt; the negative pass keeps everything else
+        neg_context = context
+        if isinstance(context, dict):
+            neg_context = {k: v for k, v in context.items() if k not in ("regions", "_masks")}
         mu = shift if shift > 0 else self.calculate_mu((h // self.patch) * (w // self.patch))
         sched.set_timesteps(sigmas=np.linspace(1.0, 1 / steps, steps), mu=mu, device=device)
         p_emb, p_mask = pad_embeds([pos], device)
@@ -493,9 +597,12 @@ class Krea2Backend(Backend):
                 sig = (t / 1000).reshape(1).to(device)
                 pred = self.predict(model, latents, sig, p_emb, p_mask, context)
                 if cfg != 1.0:
-                    uncond = self.predict(model, latents, sig, n_emb, n_mask, context)
+                    uncond = self.predict(model, latents, sig, n_emb, n_mask, neg_context)
                     pred = uncond + cfg * (pred - uncond)
                 latents = sched.step(pred, t, latents, return_dict=False)[0]
+                if inpaint is not None:
+                    level = sched.sigmas[i + 1].to(device, torch.float32)
+                    latents = repaint * latents + (1 - repaint) * ((1 - level) * known + level * noise)
                 if progress:
                     progress(i + 1, len(timesteps))
         if output == "latent":

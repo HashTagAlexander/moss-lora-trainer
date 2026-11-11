@@ -187,6 +187,39 @@ splitting a single job across GPUs.
   then the most free memory. Generating on a GPU that is also training keeps working, with the text encoder off the GPU.
 - If the server was started with `CUDA_VISIBLE_DEVICES` set (numeric), only those GPUs are offered.
 
+## Inpainting, control images and regions (Krea 2 / Kroma)
+
+With a Krea 2 or Kroma model selected, the Generate tab has three extras. They use community add-ons trained on
+stock Krea 2, so on Kroma (a full fine-tune from v0.2 on) expect to tune strengths. Nothing is downloaded until you
+press **Download** on an add-on (or run `python -m mosstrainer.addons inpaint depth …`); files go to the Hugging Face
+cache like the base models.
+
+- **Inpainting**: add a source image, press **Paint a mask** and brush over what should change. The prompt says what
+  goes there.
+  - *With the inpaint LoRA* ([Cierpliwy/krea2-inpaint-edit](https://huggingface.co/Cierpliwy/krea2-inpaint-edit), 457 MB):
+    the painted part is blacked out and the LoRA fills it. It was trained with ai-toolkit's `kv_cache`, so the
+    reference image only attends to itself here, which gives the same result as ComfyUI's cached pass.
+  - *No LoRA*: the model repaints the masked part and the rest of the picture is put back at every step. Needs no
+    download and works with your own LoRAs; edges blend less well.
+  - **Keep the rest as it is** pastes the result into the source with a soft edge, so unpainted pixels don't change.
+- **Control image**: upload a photo and press **Make a … map**, or upload a ready-made map.
+
+  | Type | Add-on | How it reads the map |
+  | --- | --- | --- |
+  | Depth | [Patil/Krea-2-depth-controlnet](https://huggingface.co/Patil/Krea-2-depth-controlnet) (862 MB) | extra input channels beside the noisy picture, plus a rank-64 LoRA. The base model's own input layer is kept, as in `comfyui-krea2-controlnet`. Combines with a source image, a mask and regions |
+  | Pose | [thedeoxen/Krea-2-pose-controlnet](https://huggingface.co/thedeoxen/Krea-2-pose-controlnet) (229 MB) | as the reference image of an ostris-style edit LoRA. Trained on Krea 2 Turbo; strength 0.8–1 |
+  | Canny | [nynxz/NK2E](https://huggingface.co/nynxz/NK2E) canny v0.1 (193 MB) | as a plain in-context reference (text-only prompt). Experimental and loose; strength around 0.7 |
+
+  Pose and canny use the model's one reference slot, so they can't run together with a source image. Maps from a
+  photo: depth uses Depth Anything V2 Large (1.3 GB, **CC BY-NC 4.0**), pose uses ViTPose + RT-DETR (0.5 GB, body
+  skeleton only, no hands or face), canny needs nothing (OpenCV's `Canny(100, 200)` rebuilt in numpy). The result
+  takes the control image's shape at about the size you set.
+- **Regions**: drag boxes on the frame and give each its own prompt (up to 8). All prompts go in one pass: prompts
+  can't see each other, a region's prompt and its image tokens see only each other, and the main prompt sees the whole
+  picture (the mask of [ComfyUI-Krea2-Regional](https://github.com/januspluto/ComfyUI-Krea2-Regional)). No download.
+  The main prompt still decides the composition, so say there where things are. With CFG above 1 the negative prompt
+  stays global.
+
 ## Edit Pairs app (macOS)
 
 `tools/EditPairs` is a small Mac app for building edit-pair datasets. Drop source (control) images on one side and
