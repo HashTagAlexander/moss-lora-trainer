@@ -117,7 +117,8 @@ renting an instance with the template is all it takes: open **Open → MOSS Trai
    cd /workspace/loratrainer && bash setup.sh
    ```
    This installs uv, a Python 3.12 venv, PyTorch (cu128 wheels for Blackwell) and the dependencies. It
-   then downloads the Kroma v0.3 teacher (about 35 GB) and starts the UI in a tmux session on port **9090**. At the end it
+   then starts the UI in a tmux session on port **9090** and downloads the Kroma v0.3 teacher (about 35 GB) in the
+   background, with its progress under **Settings → Models**. At the end it
    prints the URL and a generated password (user `admin`).
 4. **Open the UI.** On vast.ai, port 9090 is mapped to a random external port: see *IP Port Info* on
    the instance card. Alternatively, use an SSH tunnel:

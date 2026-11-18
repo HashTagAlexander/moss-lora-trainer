@@ -133,9 +133,9 @@ const GenExtras = (() => {
     function chip(id) {
       const a = addons[id];
       if (!a) return "";
-      const pct = (a.message.match(/(\d+)%/) || [])[1];
+      const pct = (a.message.match(/(\d+)%/) || [])[1], got = (a.message.match(/([\d.]+ ?[KMG]B)\b/) || [])[1];
       const state = a.state === "done" ? `<span class="addon-ok">${I.check} Ready</span>`
-        : a.state === "downloading" ? `<span class="faint">Downloading${pct ? ` ${pct}%` : "…"}</span>`
+        : a.state === "downloading" ? `<span class="faint">Downloading${pct ? ` ${pct}%` : got ? ` ${got}` : "…"}</span>`
         : `<button class="btn btn-sm" data-get="${id}">${I.download} Download</button>`;
       return `<div class="addon" title="${esc(a.about)} License: ${esc(a.license)}.">
           <a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.label)}</a>

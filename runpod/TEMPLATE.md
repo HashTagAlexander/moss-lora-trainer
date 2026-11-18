@@ -10,7 +10,8 @@ finish, then click **Connect → HTTP Service [9090]**.
   model weights (`hf_cache/`) and your data (`moss_workspace/`).
 - **[`boot.sh`](boot.sh) runs at every start**, in the background next to RunPod's own `/start.sh` (SSH,
   Jupyter). It updates the code, then runs `setup.sh`, which reinstalls whatever the wipe removed (tmux, git) and
-  starts the UI. The first start takes 10–20 minutes, mostly downloading models; later starts take a minute or two.
+  starts the UI. The first start takes a few minutes until the UI is up; the models in `MODELS` then download in the
+  background (progress under **Settings → Models**). Later starts take a minute or two.
 - **The UI is public.** It's served at `https://<pod id>-9090.proxy.runpod.net` with RunPod's HTTPS, and anyone with
   the link can reach it, so it keeps its own `admin` login. Set the password with `MOSS_TRAINER_PASSWORD`
   (below), or read the generated one from the setup log.

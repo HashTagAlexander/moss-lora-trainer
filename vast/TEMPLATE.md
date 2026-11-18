@@ -40,7 +40,7 @@ Optional variables:
 | Variable | Purpose |
 |---|---|
 | `HF_TOKEN` | Hugging Face token, if downloads get rate-limited |
-| `MODELS` | Models to pre-download (default `kroma-v0.3-teacher`), e.g. `kroma-v0.3-teacher kroma-v0.3.1-turbo OpenMOSS-Team/MOSS-Image-Base`. `none` skips; models also download on first use |
+| `MODELS` | Models to download once the UI is up (default `kroma-v0.3-teacher`), e.g. `kroma-v0.3-teacher kroma-v0.3.1-turbo OpenMOSS-Team/MOSS-Image-Base`. `none` skips; models also download on first use |
 | `KEEP_AUTH=1` | Keep the trainer's own `admin` password as well as vast's login |
 
 Click **Create** (or **Save**). From now on, pick this template when renting.
@@ -49,7 +49,8 @@ Click **Create** (or **Save**). From now on, pick this template when renting.
 
 1. `entrypoint.sh` starts vast's services, including the Instance Portal and Caddy.
 2. It then runs `PROVISIONING_SCRIPT`: `provision.sh` clones the repo to `/workspace/loratrainer` and
-   runs `setup.sh`. This takes 10–20 minutes, mostly the 35 GB model download (Kroma v0.3 teacher).
+   runs `setup.sh`. The UI is up after a few minutes; the 35 GB model download (Kroma v0.3 teacher) then runs in
+   the background, with its progress under **Settings → Models** in the UI.
 3. `setup.sh` registers the UI with supervisor (`moss-trainer`), so it starts again after reboots and crashes.
 
 You can follow progress in **Open → Instance Portal → Logs → `moss-setup.log`**. The **MOSS Trainer**

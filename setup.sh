@@ -15,7 +15,8 @@
 #   NO_AUTH=1                     disable the password (only if you use an SSH tunnel!)
 #   HF_TOKEN=hf_...               Hugging Face token (gated models like Fibo 2.0 need one; it can also be
 #                                 entered later in the web UI under Settings)
-#   MODELS="kroma-v0.3-teacher"   models to pre-download ("" or none to skip), e.g. also
+#   MODELS="kroma-v0.3-teacher"   models to download once the UI is up, in the background with their progress on
+#                                 the Settings page ("" or none to skip), e.g. also
 #                                 OpenMOSS-Team/MOSS-Image-Base, kroma-v0.3.1-turbo, krea2-raw, briaai/Fibo-2.0-dev,
 #                                 briaai/Fibo-2.0-edit-turbo (see mosstrainer/config.py)
 #   TORCH_INDEX=https://download.pytorch.org/whl/cu128   torch wheel index
@@ -123,14 +124,7 @@ uv pip install flash-linear-attention >/dev/null 2>&1 && c_ok "flash-linear-atte
   || c_warn "flash-linear-attention not installed (caption encoding will just be slower)"
 c_ok "dependencies installed"
 
-c_step "Model weights → $HF_HOME"
 mkdir -p "$HF_HOME" "$MOSS_WORKSPACE"
-for m in $MODELS; do
-  echo "downloading $m (MOSS ≈30 GB, Kroma/Krea 2 ≈35 GB, Fibo 2.0 ≈26 GB on first run; models not listed here download on first use)…"
-  python -c "import sys; from mosstrainer.backends import prefetch; print(prefetch(sys.argv[1]))" "$m" \
-    || c_warn "could not download $m (gated? add a token under Settings in the UI and download it there)"
-done
-c_ok "models ready"
 
 c_step "Web UI"
 if [ -n "$BEHIND_PORTAL" ]; then
@@ -199,11 +193,64 @@ else
 fi
 
 ok=""
-for _ in $(seq 1 20); do
+for _ in $(seq 1 60); do
   if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$LISTEN_PORT/api/info" ${PASSWORD:+-u "admin:$PASSWORD"} | grep -q 200; then ok=1; break; fi
   sleep 1
 done
 if [ -n "$ok" ]; then c_ok "UI is up on port $PORT"; else c_warn "UI did not answer yet — restart with: $RESTART_HINT"; fi
+
+# The UI is up before any weights arrive: a 35 GB download no longer holds it back. The UI's own downloader fetches
+# the models (same as Settings → Models → Download), so its progress shows on the Settings page.
+MODELS_NOTE=""
+if [ -n "$MODELS" ]; then
+  c_step "Model weights → $HF_HOME"
+  echo "MOSS ≈30 GB, Kroma/Krea 2 ≈35 GB, Fibo 2.0 ≈26 GB on first run; models not listed here download on first use."
+  if [ -n "$ok" ]; then
+    MOSS_UI="http://127.0.0.1:$LISTEN_PORT" MOSS_UI_PASSWORD="$PASSWORD" python - $MODELS <<'EOF' || true
+import base64, json, os, sys, urllib.request
+
+base, password, token = os.environ["MOSS_UI"], os.environ.get("MOSS_UI_PASSWORD", ""), os.environ.get("HF_TOKEN", "")
+
+
+def call(path, body=None, method=None):
+    req = urllib.request.Request(base + path, method=method, headers={"Content-Type": "application/json"},
+                                 data=None if body is None else json.dumps(body).encode())
+    if password:
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"admin:{password}".encode()).decode())
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+try:
+    have = call("/api/settings")
+    if token and not (have["env_hf_token"] or have["has_hf_token"]):
+        # the UI was started by supervisor or an older tmux server and didn't inherit HF_TOKEN: give it the token the
+        # way the Settings page would, or the downloads below (and gated models) would run without it
+        call("/api/settings", {"hf_token": token}, "PUT")
+        print("HF_TOKEN saved to the trainer's Settings (the UI process didn't have it)")
+    elif not (token or have["env_hf_token"] or have["has_hf_token"]):
+        print("no Hugging Face token: downloads work but are rate-limited (add one under Settings for more speed)")
+except Exception as e:  # noqa: BLE001
+    print(f"! couldn't read the trainer's settings: {e}")
+for model in sys.argv[1:]:
+    try:
+        state = call("/api/models/download", {"model": model}, "POST")["state"]
+        print(f"{model}: {'already downloaded' if state == 'done' else 'downloading in the background'}")
+    except Exception as e:  # noqa: BLE001
+        detail = e.read().decode(errors="replace")[:200] if hasattr(e, "read") else e
+        print(f"! {model}: couldn't start the download ({detail}); use Settings → Models in the UI")
+EOF
+    MODELS_NOTE="downloading in the background: $MODELS  (progress: Settings page → Models)"
+  else
+    # No UI to hand them to: fetch them here, with progress forced on (huggingface_hub is silent without a terminal).
+    for m in $MODELS; do
+      echo "downloading $m …"
+      TQDM_POSITION=-1 TQDM_MININTERVAL=15 python -c "import sys; from mosstrainer.backends import prefetch; print(prefetch(sys.argv[1]))" "$m" \
+        || c_warn "could not download $m (gated? add a token under Settings in the UI and download it there)"
+    done
+    c_ok "models ready"
+  fi
+fi
 
 PUBLIC_IP="${PUBLIC_IPADDR:-$(curl -s --max-time 3 https://ifconfig.me || echo '<instance-ip>')}"
 EXT_PORT_VAR="VAST_TCP_PORT_${PORT}"
@@ -231,5 +278,6 @@ if [ -n "$PASSWORD" ]; then
   echo "  Login:     admin / $PASSWORD"
 fi
 echo "  Data:      $MOSS_WORKSPACE"
+[ -n "$MODELS_NOTE" ] && echo "  Models:    $MODELS_NOTE"
 echo "  Restart:   $RESTART_HINT"
 echo "────────────────────────────────────────────────────────────"

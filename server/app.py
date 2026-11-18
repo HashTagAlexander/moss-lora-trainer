@@ -550,6 +550,7 @@ def _tail_line(path: Path) -> str:
             text = f.read().decode("utf-8", "replace")
     except FileNotFoundError:
         return ""
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)  # progress bars move the cursor
     lines = [ln.strip() for ln in re.split(r"[\r\n]", text) if ln.strip()]
     return lines[-1][-300:] if lines else ""
 
@@ -577,9 +578,12 @@ class DownloadManager:
             code = "import sys; from mosstrainer.backends import prefetch; print('Done:', prefetch(sys.argv[1]))"
             if addon:
                 code = "import sys; from mosstrainer.addons import fetch; print('Done:', *fetch(sys.argv[1]))"
+            # huggingface_hub only draws progress on a terminal: TQDM_POSITION=-1 is its switch for logs like this one
+            # (otherwise a 35 GB download prints nothing), and the interval keeps the log small
             self.procs[model] = subprocess.Popen(
                 [sys.executable, "-c", code, addon or model], cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True)
+                env={"TQDM_POSITION": "-1", "TQDM_MININTERVAL": "5", **os.environ, "PYTHONUNBUFFERED": "1"},
+                start_new_session=True)
 
     def status(self, model: str) -> dict:
         slug = self._slug(model)
