@@ -273,6 +273,7 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .access-list .ok { color: var(--green); }
 .access-list .bad { color: var(--yellow); }
 .dl-msg { font-size: 11.5px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-warn { font-size: 11.5px; max-width: 260px; color: var(--red); margin-top: 4px; line-height: 1.35; }
 
 /* ---------- VLM captioning ---------- */
 .item .vlm { position: absolute; top: 8px; right: 44px; opacity: 0; transition: opacity .15s; background: rgba(10, 12, 16, .8); }

@@ -1562,15 +1562,20 @@ async function pageSettings() {
     $("#models").innerHTML = `<table><thead><tr><th>Model</th><th>Use</th><th>Status</th><th></th></tr></thead><tbody>
       ${models.map((m) => `<tr><td><b>${esc(m.label)}</b><div class="faint mono" style="font-size:11.5px">${m.repo ? `<a href="https://huggingface.co/${esc(m.repo)}" target="_blank" rel="noopener">${esc(m.repo)}</a>` : esc(m.id)}${m.gated ? " · gated" : ""}</div></td>
         <td class="muted">${m.trainable ? "Training + generation" : "Generation"}</td>
-        <td><span class="badge ${DL[m.download.state]}">${DL_LABEL[m.download.state]}</span>${m.download.message ? `<div class="faint mono dl-msg" title="${esc(m.download.message)}">${esc(m.download.message)}</div>` : ""}</td>
-        <td style="text-align:right">${m.download.state === "downloading" ? "" : `<button class="btn btn-sm" data-dl="${esc(m.id)}">${I.download} ${m.download.state === "done" ? "Verify" : "Download"}</button>`}</td></tr>`).join("")}
+        <td><span class="badge ${DL[m.download.state]}">${DL_LABEL[m.download.state]}</span>${m.download.message ? `<div class="faint mono dl-msg" title="${esc(m.download.message)}">${esc(m.download.message)}</div>` : ""}
+          ${m.download.no_token ? `<div class="dl-warn">Running without your Hugging Face token (it was saved after this started), so Hugging Face rate-limits it. Restart to use the token.</div>` : ""}</td>
+        <td style="text-align:right">${m.download.state === "downloading"
+          ? `<button class="btn btn-sm ${m.download.no_token ? "" : "btn-ghost"}" data-dl="${esc(m.id)}" data-restart="1" title="Stop and start again with the current token. Finished files are kept; the file in progress starts over.">${I.reset} Restart</button>`
+          : `<button class="btn btn-sm" data-dl="${esc(m.id)}">${I.download} ${m.download.state === "done" ? "Verify" : "Download"}</button>`}</td></tr>`).join("")}
       </tbody></table>`;
   }, 2000);
   $("#models").onclick = async (e) => {
     const b = e.target.closest("[data-dl]");
     if (!b) return;
+    const restart = !!b.dataset.restart;
+    if (restart && !(await confirmBox("Restart this download?", "Files that finished are kept. The file being downloaded right now starts again from zero.", "Restart"))) return;
     b.disabled = true;
-    await guard(() => api("/api/models/download", { method: "POST", body: { model: b.dataset.dl } }), "Download started");
+    await guard(() => api("/api/models/download", { method: "POST", body: { model: b.dataset.dl, restart } }), restart ? "Download restarted" : "Download started");
     modelsKey = "";
   };
 }

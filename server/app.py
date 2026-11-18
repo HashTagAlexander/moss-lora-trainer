@@ -561,17 +561,30 @@ class DownloadManager:
     def __init__(self):
         self.lock = threading.Lock()
         self.procs: dict[str, subprocess.Popen] = {}
+        self.with_token: dict[str, bool] = {}  # whether each download started with a Hugging Face token
 
     @staticmethod
     def _slug(model: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]", "_", model)
 
-    def start(self, model: str, addon: str | None = None):
-        """`model` names the download; with `addon`, it fetches that Generate-tab add-on instead of a base model."""
+    def start(self, model: str, addon: str | None = None, restart: bool = False):
+        """`model` names the download; with `addon`, it fetches that Generate-tab add-on instead of a base model.
+        `restart` stops a running one first: a download keeps the token it started with, so this is how one picks
+        up a token saved later. Finished files stay; the file in progress starts over (Xet doesn't resume it)."""
         with self.lock:
             p = self.procs.get(model)
             if p and p.poll() is None:
-                return
+                if not restart:
+                    return
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)  # its own session (start_new_session below)
+                except ProcessLookupError:
+                    pass
+                try:
+                    p.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait()
             slug = self._slug(model)
             (DOWNLOADS / f"{slug}.ok").unlink(missing_ok=True)
             log = open(DOWNLOADS / f"{slug}.log", "w")
@@ -579,10 +592,13 @@ class DownloadManager:
             if addon:
                 code = "import sys; from mosstrainer.addons import fetch; print('Done:', *fetch(sys.argv[1]))"
             # huggingface_hub only draws progress on a terminal: TQDM_POSITION=-1 is its switch for logs like this one
-            # (otherwise a 35 GB download prints nothing), and the interval keeps the log small
+            # (otherwise a 35 GB download prints nothing), and the interval keeps the log small.
+            # HF_XET_HIGH_PERFORMANCE lets Xet use the whole connection and every core; its default holds back.
+            self.with_token[model] = bool(os.environ.get("HF_TOKEN"))
             self.procs[model] = subprocess.Popen(
                 [sys.executable, "-c", code, addon or model], cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
-                env={"TQDM_POSITION": "-1", "TQDM_MININTERVAL": "5", **os.environ, "PYTHONUNBUFFERED": "1"},
+                env={"TQDM_POSITION": "-1", "TQDM_MININTERVAL": "5", "HF_XET_HIGH_PERFORMANCE": "1", **os.environ,
+                     "PYTHONUNBUFFERED": "1"},
                 start_new_session=True)
 
     def status(self, model: str) -> dict:
@@ -591,7 +607,9 @@ class DownloadManager:
         with self.lock:
             p = self.procs.get(model)
             if p and p.poll() is None:
-                return {"state": "downloading", "message": msg}
+                # started before a token was saved: it is still running without one (rate-limited by Hugging Face)
+                stale = not self.with_token.get(model, True) and bool(os.environ.get("HF_TOKEN"))
+                return {"state": "downloading", "message": msg, "no_token": stale}
             if p and p.returncode == 0:
                 (DOWNLOADS / f"{slug}.ok").touch()
             elif p:
@@ -801,10 +819,11 @@ def list_models():
 
 @app.post("/api/models/download")
 async def download_model(request: Request):
-    model = (await request.json()).get("model")
+    body = await request.json()
+    model = body.get("model")
     if model not in MODEL_SPECS:
         raise HTTPException(400, "Unknown model")
-    downloads.start(model)
+    await run_in_threadpool(downloads.start, model, None, bool(body.get("restart")))
     return downloads.status(model)
 
 

@@ -152,6 +152,8 @@ source "$ROOT/.venv/bin/activate"
 export HF_HOME="$HF_HOME"
 export MOSS_WORKSPACE="$MOSS_WORKSPACE"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Hugging Face downloads use the whole connection and every core (Xet's default holds back); set it to 0 to turn off
+export HF_XET_HIGH_PERFORMANCE="\${HF_XET_HIGH_PERFORMANCE:-1}"
 export MOSS_TRAINER_PASSWORD="\$( [ -z "${NO_AUTH:-}" ] && cat "$ROOT/.password" 2>/dev/null )"
 if command -v tmux >/dev/null 2>&1 && [ -z "\${FOREGROUND:-}" ]; then
   tmux kill-session -t moss 2>/dev/null || true
@@ -229,7 +231,8 @@ try:
         call("/api/settings", {"hf_token": token}, "PUT")
         print("HF_TOKEN saved to the trainer's Settings (the UI process didn't have it)")
     elif not (token or have["env_hf_token"] or have["has_hf_token"]):
-        print("no Hugging Face token: downloads work but are rate-limited (add one under Settings for more speed)")
+        print("no Hugging Face token: downloads work but Hugging Face rate-limits them. Set HF_TOKEN for setup, or save "
+              "one under Settings and press Restart on the download there")
 except Exception as e:  # noqa: BLE001
     print(f"! couldn't read the trainer's settings: {e}")
 for model in sys.argv[1:]:
@@ -245,7 +248,7 @@ EOF
     # No UI to hand them to: fetch them here, with progress forced on (huggingface_hub is silent without a terminal).
     for m in $MODELS; do
       echo "downloading $m …"
-      TQDM_POSITION=-1 TQDM_MININTERVAL=15 python -c "import sys; from mosstrainer.backends import prefetch; print(prefetch(sys.argv[1]))" "$m" \
+      TQDM_POSITION=-1 TQDM_MININTERVAL=15 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}" python -c "import sys; from mosstrainer.backends import prefetch; print(prefetch(sys.argv[1]))" "$m" \
         || c_warn "could not download $m (gated? add a token under Settings in the UI and download it there)"
     done
     c_ok "models ready"

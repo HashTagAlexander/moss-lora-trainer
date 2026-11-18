@@ -39,7 +39,7 @@ Optional variables:
 
 | Variable | Purpose |
 |---|---|
-| `HF_TOKEN` | Hugging Face token, if downloads get rate-limited |
+| `HF_TOKEN` | Hugging Face token. **Recommended**: without one, Hugging Face rate-limits the model download that starts at boot. A token saved later under **Settings** only applies after pressing **Restart** on that download |
 | `MODELS` | Models to download once the UI is up (default `kroma-v0.3-teacher`), e.g. `kroma-v0.3-teacher kroma-v0.3.1-turbo OpenMOSS-Team/MOSS-Image-Base`. `none` skips; models also download on first use |
 | `KEEP_AUTH=1` | Keep the trainer's own `admin` password as well as vast's login |
 
