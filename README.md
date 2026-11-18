@@ -117,7 +117,7 @@ renting an instance with the template is all it takes: open **Open → MOSS Trai
    cd /workspace/loratrainer && bash setup.sh
    ```
    This installs uv, a Python 3.12 venv, PyTorch (cu128 wheels for Blackwell) and the dependencies. It
-   then downloads MOSS-Image-Base and starts the UI in a tmux session on port **9090**. At the end it
+   then downloads the Kroma v0.3 teacher (about 35 GB) and starts the UI in a tmux session on port **9090**. At the end it
    prints the URL and a generated password (user `admin`).
 4. **Open the UI.** On vast.ai, port 9090 is mapped to a random external port: see *IP Port Info* on
    the instance card. Alternatively, use an SSH tunnel:
@@ -128,7 +128,7 @@ renting an instance with the template is all it takes: open **Open → MOSS Trai
 5. *(Optional)* To restart the UI automatically after a reboot, set the instance's **on-start script** to
    `bash /workspace/loratrainer/start.sh`.
 
-Useful setup options: `HF_TOKEN=hf_... bash setup.sh`, `MODELS="OpenMOSS-Team/MOSS-Image-Base OpenMOSS-Team/MOSS-Image-SFT" bash setup.sh`,
+Useful setup options: `HF_TOKEN=hf_... bash setup.sh`, `MODELS="kroma-v0.3-teacher OpenMOSS-Team/MOSS-Image-Base" bash setup.sh` (default: `kroma-v0.3-teacher`; `none` to skip),
 `NO_AUTH=1` (only behind an SSH tunnel), `TORCH_INDEX=https://download.pytorch.org/whl/cu130`.
 
 Everything persistent lives under `/workspace/moss_workspace/` (datasets, jobs, caches) and

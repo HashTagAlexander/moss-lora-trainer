@@ -15,8 +15,8 @@
 #   NO_AUTH=1                     disable the password (only if you use an SSH tunnel!)
 #   HF_TOKEN=hf_...               Hugging Face token (gated models like Fibo 2.0 need one; it can also be
 #                                 entered later in the web UI under Settings)
-#   MODELS="OpenMOSS-Team/MOSS-Image-Base"   models to pre-download ("" or none to skip), e.g. also
-#                                 kroma-v0.3-teacher, kroma-v0.3.1-turbo, krea2-raw, briaai/Fibo-2.0-dev,
+#   MODELS="kroma-v0.3-teacher"   models to pre-download ("" or none to skip), e.g. also
+#                                 OpenMOSS-Team/MOSS-Image-Base, kroma-v0.3.1-turbo, krea2-raw, briaai/Fibo-2.0-dev,
 #                                 briaai/Fibo-2.0-edit-turbo (see mosstrainer/config.py)
 #   TORCH_INDEX=https://download.pytorch.org/whl/cu128   torch wheel index
 #   WORKSPACE_DIR=/workspace      where datasets/jobs/cache and the HF cache live
@@ -41,7 +41,7 @@ fi
 # vast's Caddy already requires its own login in front of proxied apps; don't ask twice.
 if [ -n "$BEHIND_PORTAL" ] && [ -z "${KEEP_AUTH:-}" ]; then NO_AUTH=1; fi
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
-MODELS="${MODELS-OpenMOSS-Team/MOSS-Image-Base}"
+MODELS="${MODELS-kroma-v0.3-teacher}"
 [ "$MODELS" = none ] && MODELS=""  # explicit "download nothing" (some UIs drop empty variables)
 if [ -z "${WORKSPACE_DIR:-}" ]; then
   if [ -d /workspace ] && [ -w /workspace ]; then WORKSPACE_DIR=/workspace; else WORKSPACE_DIR="$ROOT"; fi
