@@ -132,6 +132,12 @@ renting an instance with the template is all it takes: open **Open → MOSS Trai
 Useful setup options: `HF_TOKEN=hf_... bash setup.sh`, `MODELS="kroma-v0.3-teacher OpenMOSS-Team/MOSS-Image-Base" bash setup.sh` (default: `kroma-v0.3-teacher`; `none` to skip),
 `NO_AUTH=1` (only behind an SSH tunnel), `TORCH_INDEX=https://download.pytorch.org/whl/cu130`.
 
+`apt` is only used when `tmux`, `curl` or `git` is missing, always with a time limit, and through a mirror (`APT_MIRROR`,
+default `http://mirrors.edge.kernel.org/ubuntu`) instead of Ubuntu's own package servers, which have slow spells that
+hang `apt-get update`. The original source files are kept as `*.moss.orig`; if the mirror fails, they are put back and
+tried once. `APT_MIRROR=none` leaves apt alone. If apt fails altogether setup carries on: without `tmux` the UI simply
+runs in the background, with its log in `moss_workspace/server.log`.
+
 Everything persistent lives under `/workspace/moss_workspace/` (datasets, jobs, caches) and
 `/workspace/hf_cache/` (model weights).
 

@@ -21,6 +21,7 @@
 #                                 briaai/Fibo-2.0-edit-turbo (see mosstrainer/config.py)
 #   TORCH_INDEX=https://download.pytorch.org/whl/cu128   torch wheel index
 #   WORKSPACE_DIR=/workspace      where datasets/jobs/cache and the HF cache live
+#   APT_MIRROR=http://mirrors.edge.kernel.org/ubuntu   Ubuntu mirror apt uses instead of archive.ubuntu.com (none: leave apt alone)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,13 +62,55 @@ c_ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 c_step() { printf '\n\033[1;35m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 c_warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
 
+# apt is only used when tmux, curl or git is missing, and never without a time limit. It goes through $APT_MIRROR
+# rather than Ubuntu's own servers (archive.ubuntu.com, security.ubuntu.com), which have slow spells where
+# `apt-get update` hangs for many minutes; if the mirror fails, the original servers get one try.
+# APT_MIRROR=none keeps apt as the image set it up.
+APT_MIRROR="${APT_MIRROR-http://mirrors.edge.kernel.org/ubuntu}"
+[ "$APT_MIRROR" = none ] && APT_MIRROR=""
+APT_SOURCES="${APT_SOURCES:-/etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources}"
+apt_install() {  # apt_install <seconds for update> <packages…>
+  local limit="$1" t=""; shift
+  command -v timeout >/dev/null 2>&1 && t="timeout -k 10"
+  local opts="-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=1 -o DPkg::Lock::Timeout=60"
+  ${t:+$t $limit} $SUDO apt-get $opts -o APT::Update::Error-Mode=any update -qq \
+    && DEBIAN_FRONTEND=noninteractive ${t:+$t $((limit * 3))} $SUDO apt-get $opts install -y -qq "$@" >/dev/null
+}
+apt_use_mirror() {  # Ubuntu's own servers -> $APT_MIRROR in every apt source file that names them (originals: *.moss.orig)
+  local f changed=""
+  for f in $APT_SOURCES; do
+    [ -f "$f" ] && grep -Eq 'https?://[a-z0-9.-]*(archive|security)\.ubuntu\.com/ubuntu' "$f" || continue
+    [ -e "$f.moss.orig" ] || $SUDO cp -p "$f" "$f.moss.orig"
+    sed -E "s#https?://[a-z0-9.-]*(archive|security)\.ubuntu\.com/ubuntu#$APT_MIRROR#g" "$f.moss.orig" | $SUDO tee "$f" >/dev/null
+    changed=1
+  done
+  [ -n "$changed" ]
+}
+apt_use_original() {  # undo apt_use_mirror
+  local f changed=""
+  for f in $APT_SOURCES; do
+    [ -f "$f.moss.orig" ] || continue
+    $SUDO cp -p "$f.moss.orig" "$f" && changed=1
+  done
+  [ -n "$changed" ]
+}
+
 c_step "System packages"
 if command -v apt-get >/dev/null 2>&1; then
   SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo"
   NEED=""
   for p in tmux curl git; do command -v "$p" >/dev/null 2>&1 || NEED="$NEED $p"; done
   if [ -n "$NEED" ]; then
-    $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq $NEED >/dev/null || c_warn "apt install failed for:$NEED"
+    if [ -n "$APT_MIRROR" ] && apt_use_mirror; then echo "apt: using the mirror $APT_MIRROR"; fi
+    if ! apt_install 75 $NEED; then
+      c_warn "apt didn't finish in time"
+      if apt_use_original; then
+        echo "trying Ubuntu's own servers instead"
+        apt_install 120 $NEED || c_warn "apt install failed for:$NEED (carrying on without)"
+      else
+        c_warn "apt install failed for:$NEED (carrying on without)"
+      fi
+    fi
   fi
 fi
 c_ok "system packages ready"
@@ -155,12 +198,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Hugging Face downloads use the whole connection and every core (Xet's default holds back); set it to 0 to turn off
 export HF_XET_HIGH_PERFORMANCE="\${HF_XET_HIGH_PERFORMANCE:-1}"
 export MOSS_TRAINER_PASSWORD="\$( [ -z "${NO_AUTH:-}" ] && cat "$ROOT/.password" 2>/dev/null )"
-if command -v tmux >/dev/null 2>&1 && [ -z "\${FOREGROUND:-}" ]; then
+if [ -n "\${FOREGROUND:-}" ]; then
+  exec python -m server.app --host $LISTEN_HOST --port $LISTEN_PORT
+elif command -v tmux >/dev/null 2>&1; then
   tmux kill-session -t moss 2>/dev/null || true
   tmux new-session -d -s moss "python -m server.app --host $LISTEN_HOST --port $LISTEN_PORT 2>&1 | tee -a \$MOSS_WORKSPACE/server.log"
   echo "running in tmux session 'moss' (attach: tmux attach -t moss)"
 else
-  exec python -m server.app --host $LISTEN_HOST --port $LISTEN_PORT
+  # no tmux (apt couldn't install it): run in the background all the same
+  pkill -f " -m server.app --host $LISTEN_HOST --port $LISTEN_PORT" 2>/dev/null && sleep 2 || true  # a restart
+  nohup python -m server.app --host $LISTEN_HOST --port $LISTEN_PORT >> "\$MOSS_WORKSPACE/server.log" 2>&1 < /dev/null &
+  echo "running in the background, without tmux (log: \$MOSS_WORKSPACE/server.log)"
 fi
 EOF
 chmod +x "$ROOT/start.sh"
@@ -191,7 +239,7 @@ EOF
   RESTART_HINT="supervisorctl restart moss-trainer   (log: /var/log/portal/moss-trainer.log)"
 else
   "$ROOT/start.sh"
-  RESTART_HINT="$ROOT/start.sh   (log: tmux attach -t moss)"
+  RESTART_HINT="$ROOT/start.sh   (log: $MOSS_WORKSPACE/server.log)"
 fi
 
 ok=""

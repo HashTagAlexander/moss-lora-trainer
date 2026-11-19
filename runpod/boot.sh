@@ -10,7 +10,7 @@
 #   MOSS_TRAINER_REPO      git URL of the trainer (default: github.com/HashTagAlexander/moss-lora-trainer)
 #   MOSS_TRAINER_BRANCH    branch to check out (default: main)
 #   MOSS_TRAINER_UPDATE=0  keep the current checkout instead of pulling on every start
-#   MOSS_TRAINER_PASSWORD, HF_TOKEN, MODELS, PORT   passed through to setup.sh
+#   MOSS_TRAINER_PASSWORD, HF_TOKEN, MODELS, PORT, APT_MIRROR   passed through to setup.sh
 #
 # Progress: /workspace/moss-setup.log
 
@@ -31,7 +31,30 @@ main() {
     return 1
   fi
   if ! command -v git >/dev/null 2>&1; then
-    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null
+    # through a mirror and with a time limit: Ubuntu's own servers have slow spells that hang apt. If the mirror
+    # fails, they get one try. (setup.sh does the same for what it needs; APT_MIRROR=none leaves apt alone.)
+    local opts="-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=1" f
+    local mirror="${APT_MIRROR-http://mirrors.edge.kernel.org/ubuntu}"
+    [ "$mirror" = none ] && mirror=""
+    get_git() {
+      timeout -k 10 "$1" apt-get $opts -o APT::Update::Error-Mode=any update -qq \
+        && DEBIAN_FRONTEND=noninteractive timeout -k 10 300 apt-get $opts install -y -qq git >/dev/null
+    }
+    if [ -n "$mirror" ]; then
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] && grep -Eq 'https?://[a-z0-9.-]*(archive|security)\.ubuntu\.com/ubuntu' "$f" || continue
+        [ -e "$f.moss.orig" ] || cp -p "$f" "$f.moss.orig"
+        sed -E "s#https?://[a-z0-9.-]*(archive|security)\.ubuntu\.com/ubuntu#$mirror#g" "$f.moss.orig" > "$f"
+      done
+      echo "[moss] apt: using the mirror $mirror"
+    fi
+    if ! get_git 75; then
+      echo "[moss] apt didn't finish in time; trying Ubuntu's own servers"
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f.moss.orig" ] && cp -p "$f.moss.orig" "$f"
+      done
+      get_git 120 || { echo "[moss] ERROR: couldn't install git (apt is unreachable)"; return 1; }
+    fi
   fi
   if [ ! -d "$dir/.git" ]; then
     git clone --depth 1 --branch "$branch" "$repo" "$dir" || { echo "[moss] ERROR: git clone failed"; return 1; }

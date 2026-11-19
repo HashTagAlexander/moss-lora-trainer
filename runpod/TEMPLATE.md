@@ -48,6 +48,7 @@ in the background, SSH comes up straight away while setup runs.
 | `MOSS_TRAINER_PASSWORD` | the UI's `admin` password. Store it as a RunPod secret and enter `{{ RUNPOD_SECRET_moss_password }}` as the value |
 | `HF_TOKEN` | Hugging Face token. **Recommended** (as a secret): without one, Hugging Face rate-limits the model download that starts at boot, and gated models (Fibo 2.0) can't download. A token saved later under **Settings** only applies to a running download after pressing **Restart** on it |
 | `MODELS` | models to download during setup (default `kroma-v0.3-teacher`), e.g. `briaai/Fibo-2.0-dev` or `kroma-v0.3-teacher OpenMOSS-Team/MOSS-Image-Base`. Set it to `none` to skip; models also download on first use |
+| `APT_MIRROR` | Ubuntu mirror `apt` uses instead of Ubuntu's own (slow at times) servers. Default `http://mirrors.edge.kernel.org/ubuntu`; `none` leaves apt alone |
 | `MOSS_TRAINER_UPDATE` | `0` keeps the current code instead of pulling the latest on every start |
 | `MOSS_TRAINER_REPO`, `MOSS_TRAINER_BRANCH` | use a fork or another branch |
 
