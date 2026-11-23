@@ -173,6 +173,7 @@ const routes = [
   [/^\/datasets$/, "datasets", pageDatasets],
   [/^\/datasets\/([^/]+)$/, "datasets", pageDataset],
   [/^\/generate$/, "generate", pageGenerate],
+  [/^\/video$/, "video", pageVideo],
   [/^\/settings$/, "settings", pageSettings],
 ];
 
@@ -1114,6 +1115,60 @@ const sizeFor = (a, b, mp) => {
 function loadGenState() { try { return JSON.parse(localStorage.getItem(GEN_KEY)) || {}; } catch { return {}; } }
 function saveGenState(st) { try { localStorage.setItem(GEN_KEY, JSON.stringify(st)); } catch { /* private mode */ } }
 
+// The worker badges with Unload, the GPU picker and the progress card: the same on the Generate and Video Generate
+// pages, since both queue onto the same per-GPU workers. Returns the function that refreshes them.
+const W_LABEL = { unloaded: "Model not loaded", starting: "Starting", loading: "Loading model", idle: "Starting", ready: "Model ready", generating: "Generating", exiting: "Unloading" };
+function generationStatus({ st, worker, status, gpuField, gpuPick, idle, onNew }) {
+  let lastVersion = null;
+  function renderGpuPicker(gpus) {
+    gpuField.hidden = gpus.length < 2;
+    if (gpus.length && !gpus.some((x) => String(x.index) === String(st.gpu))) st.gpu = "auto";
+    if (document.activeElement === gpuPick) return;  // don't close an open list under the user
+    const options = [`<option value="auto">Auto (least busy)</option>`, ...gpus.map((x) => {
+      const mem = `${(x.mem_used / 1024).toFixed(0)}/${(x.mem_total / 1024).toFixed(0)} GB`;
+      return `<option value="${x.index}">GPU ${x.index} · ${esc(x.name.replace("NVIDIA ", ""))} · ${mem}${x.job ? ` · training ${esc(x.job)}` : ""}</option>`;
+    })].join("");
+    if (gpuPick.dataset.options !== options) { gpuPick.innerHTML = options; gpuPick.dataset.options = options; }
+    gpuPick.value = st.gpu;
+  }
+  async function refresh() {
+    const g = await api("/api/generate/status");
+    renderGpuPicker(g.gpus);
+    const many = g.gpus.length > 1;
+    const where = (w) => (many && w.gpu != null ? `GPU ${w.gpu} · ` : "");
+    worker.innerHTML = g.workers.length ? g.workers.map((w) => `<span class="badge ${w.state === "ready" ? "done" : w.state === "unloaded" ? "" : "running"}">${where(w)}${esc(W_LABEL[w.state] || w.state)}${w.model ? ` · ${esc(w.model.split("/").pop())}` : ""}</span>
+      ${w.state !== "unloaded" ? `<button class="btn btn-sm btn-ghost" data-unload="${w.gpu ?? "all"}" title="Free GPU memory">Unload</button>` : ""}`).join("")
+      : `<span class="badge">${W_LABEL.unloaded}</span>`;
+    let html = "";
+    const line = (text, style = "") => `<div class="card-body ${style ? "" : "faint"}" style="font-size:${style ? 13 : 12}px;${style}">${text}</div>`;
+    for (const w of g.workers) {
+      if (w.current) {
+        const p = w.current.progress;
+        const frac = p ? (p.image + p.step / p.steps) / p.count : 0;
+        html += `<div class="card-body"><div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(where(w))}${esc(w.current.prompt)}</div>
+          <button class="btn btn-sm" data-cancel="${esc(w.current.id)}">${I.stop} Cancel</button></div>
+          <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
+          <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? (w.current.kind === "video" ? `video · step ${p.step}/${p.steps}` : `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}`) : esc(w.message || "Preparing…")}</div></div>`;
+      }
+      if (w.queue.length) html += line(`${esc(where(w))}${w.queue.length} more queued`);
+      if (w.training && (w.current || w.queue.length)) html += line(`${esc(w.training)} is training on ${many ? `GPU ${w.gpu}` : "the GPU"}, so the text encoder stays off the GPU and new prompts encode a little slower.`);
+      if (w.last_error) html += line(`${esc(where(w))}${esc(w.last_error)}`, "color:var(--red)");
+    }
+    status.innerHTML = html || `<div class="card-body faint" style="font-size:13px">${idle(g)}</div>`;
+    if (g.version !== lastVersion) { lastVersion = g.version; onNew(); }
+  }
+  status.onclick = async (e) => {
+    const c = e.target.closest("[data-cancel]");
+    if (c) { await guard(() => api(`/api/generate/cancel/${enc(c.dataset.cancel)}`, { method: "POST" })); refresh(); }
+  };
+  worker.onclick = async (e) => {
+    const u = e.target.closest("[data-unload]");
+    if (u) { await guard(() => api(`/api/generate/unload?gpu=${enc(u.dataset.unload)}`, { method: "POST" }), "Model unloaded"); refresh(); }
+  };
+  return refresh;
+}
+
 async function pageGenerate(params) {
   if (!INFO) INFO = await api("/api/info");
   let loras = await api("/api/loras");
@@ -1171,8 +1226,7 @@ async function pageGenerate(params) {
         <button class="btn btn-primary" id="g-go">${I.spark} Generate</button>
       </div></div>
       <div class="gen-results"><div class="card" id="g-status"></div><div id="g-tools" class="gen-tools"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
-    </div>
-    <div id="g-video"></div>`;
+    </div>`;
 
   // ---- form <-> state
   const fields = { prompt: "#g-prompt", negative: "#g-negative", width: "#g-w", height: "#g-h", steps: "#g-steps", cfg: "#g-cfg",
@@ -1225,7 +1279,6 @@ async function pageGenerate(params) {
   }
   renderSource();
   const extras = GenExtras.mount({ st, save: () => saveGenState(st), krea: () => family() === "krea2", onSource: renderSource });
-  const video = GenVideo.mount($("#g-video"), { gpu: () => st.gpu });
   $("#g-vgl").onclick = async () => {
     const out = await VGL.open({ prompt: st.prompt, width: st.width, height: st.height });
     if (out == null) return;
@@ -1320,58 +1373,15 @@ async function pageGenerate(params) {
   $("#g-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); } });
 
   // ---- status
-  const W_LABEL = { unloaded: "Model not loaded", starting: "Starting", loading: "Loading model", idle: "Starting", ready: "Model ready", generating: "Generating", exiting: "Unloading" };
-  function renderGpuPicker(gpus) {
-    $("#g-gpu-field").hidden = gpus.length < 2;
-    if (gpus.length && !gpus.some((x) => String(x.index) === String(st.gpu))) st.gpu = "auto";
-    const pick = $("#g-gpu");
-    if (document.activeElement === pick) return;  // don't close an open list under the user
-    const options = [`<option value="auto">Auto (least busy)</option>`, ...gpus.map((x) => {
-      const mem = `${(x.mem_used / 1024).toFixed(0)}/${(x.mem_total / 1024).toFixed(0)} GB`;
-      return `<option value="${x.index}">GPU ${x.index} · ${esc(x.name.replace("NVIDIA ", ""))} · ${mem}${x.job ? ` · training ${esc(x.job)}` : ""}</option>`;
-    })].join("");
-    if (pick.dataset.options !== options) { pick.innerHTML = options; pick.dataset.options = options; }
-    pick.value = st.gpu;
-  }
-  async function refreshStatus() {
-    const g = await api("/api/generate/status");
-    renderGpuPicker(g.gpus);
-    const many = g.gpus.length > 1;
-    const where = (w) => (many && w.gpu != null ? `GPU ${w.gpu} · ` : "");
-    $("#g-worker").innerHTML = g.workers.length ? g.workers.map((w) => `<span class="badge ${w.state === "ready" ? "done" : w.state === "unloaded" ? "" : "running"}">${where(w)}${esc(W_LABEL[w.state] || w.state)}${w.model ? ` · ${esc(w.model.split("/").pop())}` : ""}</span>
-      ${w.state !== "unloaded" ? `<button class="btn btn-sm btn-ghost" data-unload="${w.gpu ?? "all"}" title="Free GPU memory">Unload</button>` : ""}`).join("")
-      : `<span class="badge">${W_LABEL.unloaded}</span>`;
-    let html = "";
-    const line = (text, style = "") => `<div class="card-body ${style ? "" : "faint"}" style="font-size:${style ? 13 : 12}px;${style}">${text}</div>`;
-    for (const w of g.workers) {
-      if (w.current) {
-        const p = w.current.progress;
-        const frac = p ? (p.image + p.step / p.steps) / p.count : 0;
-        html += `<div class="card-body"><div class="row" style="justify-content:space-between;margin-bottom:8px">
-          <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(where(w))}${esc(w.current.prompt)}</div>
-          <button class="btn btn-sm" data-cancel="${esc(w.current.id)}">${I.stop} Cancel</button></div>
-          <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
-          <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? (w.current.kind === "video" ? `video · step ${p.step}/${p.steps}` : `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}`) : esc(w.message || "Preparing…")}</div></div>`;
-      }
-      if (w.queue.length) html += line(`${esc(where(w))}${w.queue.length} more queued`);
-      if (w.training && (w.current || w.queue.length)) html += line(`${esc(w.training)} is training on ${many ? `GPU ${w.gpu}` : "the GPU"}, so the text encoder stays off the GPU and new prompts encode a little slower.`);
-      if (w.last_error) html += line(`${esc(where(w))}${esc(w.last_error)}`, "color:var(--red)");
-    }
-    if (!html) html = `<div class="card-body faint" style="font-size:13px">${g.workers.some((w) => w.state !== "unloaded") ? "Ready. Write a prompt and hit Generate." : "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes."}</div>`;
-    $("#g-status").innerHTML = html;
-    if (g.version !== lastVersion) { lastVersion = g.version; loadGallery(); video.refresh(); }
-  }
-  $("#g-status").onclick = async (e) => {
-    const c = e.target.closest("[data-cancel]");
-    if (c) { await guard(() => api(`/api/generate/cancel/${enc(c.dataset.cancel)}`, { method: "POST" })); refreshStatus(); }
-  };
-  $("#g-worker").onclick = async (e) => {
-    const u = e.target.closest("[data-unload]");
-    if (u) { await guard(() => api(`/api/generate/unload?gpu=${enc(u.dataset.unload)}`, { method: "POST" }), "Model unloaded"); refreshStatus(); }
-  };
+  const refreshStatus = generationStatus({
+    st, worker: $("#g-worker"), status: $("#g-status"), gpuField: $("#g-gpu-field"), gpuPick: $("#g-gpu"),
+    idle: (g) => (g.workers.some((w) => w.state !== "unloaded") ? "Ready. Write a prompt and hit Generate."
+      : "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes."),
+    onNew: () => loadGallery(),
+  });
 
   // ---- gallery
-  let items = [], lastVersion = null, limit = 60;
+  let items = [], limit = 60;
   const fileUrl = (f) => `/api/generations/file/${enc(f)}`;
   const describe = (it) => [...(it.inpaint ? ["inpaint"] : it.image_id ? ["edit"] : []), ...(it.control ? [`${it.control.type} control`] : []),
     ...(it.regions ? [`${it.regions.length} region${it.regions.length > 1 ? "s" : ""}`] : []), `seed ${it.seed}`, `${it.width}×${it.height}`, `${it.steps} steps`, `cfg ${it.cfg}`,
@@ -1482,6 +1492,12 @@ async function pageGenerate(params) {
   });
 
   every(refreshStatus, 1500);
+}
+
+// ------------------------------------------------------------------ video generate (the page itself: video.js)
+async function pageVideo() {
+  if (!INFO) INFO = await api("/api/info");
+  every(GenVideo.mount(view), 1500);
 }
 
 // ------------------------------------------------------------------ settings

@@ -25,7 +25,7 @@ with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
 | `krea2-raw`, `krea2-turbo` | Krea 2 | raw ✓ / turbo generate only | from Comfy-Org/Krea-2 |
 | `briaai/Fibo-2.0-dev` | Fibo 2.0 | ✓ | gated. Bria's full base model: 50 steps, CFG 5. Text-to-image and editing |
 | `briaai/Fibo-2.0-edit-turbo` | Fibo 2.0 | generate only | gated. 4 steps, CFG 1, made for editing a source image. LoRAs trained on Dev work on it |
-| `sulphur-3` | MiniMax H3 (video) | generate only | [SulphurAI/Sulphur-3](https://huggingface.co/SulphurAI/Sulphur-3): video with sound, in the Generate tab's Video section, 20 steps or 8 with Turbo. About 80 GB. See [Video](#video-sulphur-3) |
+| `sulphur-3` | MiniMax H3 (video) | generate only | [SulphurAI/Sulphur-3](https://huggingface.co/SulphurAI/Sulphur-3): video with sound, on the Video Generate page, 20 steps or 8 with Turbo. About 80 GB. See [Video](#video-sulphur-3) |
 
 Krea 2 models use diffusers' `Krea2Transformer2DModel` with the public Qwen3-VL-4B-Instruct text encoder and the
 Qwen-Image VAE (both byte-identical to what Krea 2 ships). Kroma LoRAs are saved in diffusers format
@@ -184,8 +184,8 @@ With 96 GB you can usually turn off gradient checkpointing at 1024 for roughly 2
 
 ## Multiple GPUs
 
-With two or more GPUs, a **GPU** picker appears in the job form and on the Generate tab (numbers are `nvidia-smi`'s;
-each process is pinned with `CUDA_VISIBLE_DEVICES`). One job or generation still uses one GPU; there is no
+With two or more GPUs, a **GPU** picker appears in the job form and on the Generate and Video Generate pages (numbers
+are `nvidia-smi`'s; each process is pinned with `CUDA_VISIBLE_DEVICES`). One job or generation still uses one GPU; there is no
 splitting a single job across GPUs.
 
 - **Training**: each GPU trains one job at a time, so you can run a job per GPU side by side. **Auto** takes a free GPU
@@ -230,11 +230,12 @@ cache like the base models.
 
 ## Video (Sulphur 3)
 
-The Generate tab has a **Video** section under the images: [Sulphur 3](https://huggingface.co/SulphurAI/Sulphur-3), a
-fine-tune of MiniMax H3. It makes video and a stereo soundtrack in one pass, 5 to 15 seconds at 24 fps, from a prompt
-and optionally a first and/or last frame. Generation only: there is no video training here.
+The **Video Generate** page (under Generate in the sidebar) runs
+[Sulphur 3](https://huggingface.co/SulphurAI/Sulphur-3), a fine-tune of MiniMax H3. It makes video and a stereo
+soundtrack in one pass, 5 to 15 seconds at 24 fps, from a prompt and optionally a first and/or last frame. Generation
+only: there is no video training here.
 
-- **What it downloads** (about 80 GB, with **Download** in the Video section or under Settings, or `MODELS="… sulphur-3"`
+- **What it downloads** (about 80 GB, with **Download** on that page or under Settings, or `MODELS="… sulphur-3"`
   for setup): `s3.safetensors` (40 GB, the file its author recommends), Comfy-Org's **int8** Qwen3-VL 32B text
   encoder (27 GB instead of 67), MiniMax H3's own video and audio decoders (11 GB) and the turbo LoRA (1.4 GB).
 - **Memory**: about 73 GB of weights, so everything stays loaded together on a 96 GB card. The text encoder is kept as

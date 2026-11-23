@@ -19,6 +19,8 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` must win over the classes that set a display (.field, .btn, .check…) */
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
 body {
   background: var(--bg);
@@ -307,9 +309,8 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .mask-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .55; cursor: crosshair; touch-action: none; }
 .mask-tools { gap: 10px; margin-top: 12px; }
 
-/* ---------- generate: video section ---------- */
-#g-video { margin-top: 36px; padding-top: 8px; border-top: 1px solid var(--border); }
-.video-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+/* ---------- video generate ---------- */
+.video-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; margin-top: 16px; align-items: start; }
 .video-card { overflow: hidden; }
 .video-card video { display: block; width: 100%; height: auto; background: #000; }
 .video-card .btn { padding: 4px 6px; }

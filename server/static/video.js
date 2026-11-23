@@ -1,5 +1,5 @@
-/* Generate tab, Video section: Sulphur 3 (a MiniMax H3 fine-tune). Video with sound, 5 to 15 seconds at 24 fps,
- * from a prompt and optionally a first and/or last frame. Generation only; see mosstrainer/video.py.
+/* The Video Generate page: Sulphur 3 (a MiniMax H3 fine-tune). Video with sound, 5 to 15 seconds at 24 fps, from a
+ * prompt and optionally a first and/or last frame. Generation only; see mosstrainer/video.py.
  */
 "use strict";
 
@@ -13,21 +13,27 @@ const GenVideo = (() => {
   const fileUrl = (f) => `/api/videos/file/${enc(f)}`;
   const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; } };
 
-  function mount(root, { gpu }) {
+  const HEAD = `<div><h1>Video Generate</h1><div class="sub">Video with sound, 5 to 15 seconds at 24 fps. Generation only.</div></div>`;
+
+  // Fills the page and returns the function that refreshes its status (the caller runs it on a timer).
+  function mount(root) {
     const models = INFO.video_models || {};
     const ids = Object.keys(models);
-    if (!ids.length) return { refresh() {} };
+    if (!ids.length) {
+      root.innerHTML = `<div class="page-head">${HEAD}</div><div class="card empty">This install has no video model.</div>`;
+      return () => {};
+    }
     const first = models[ids[0]].defaults || {};
-    const st = { prompt: "", model: ids[0], seconds: LENGTHS[0], shape: "16:9", steps: first.steps || 20, seed: -1, image: "", last_image: "", turbo: false, ...load() };
+    const st = { prompt: "", model: ids[0], seconds: LENGTHS[0], shape: "16:9", steps: first.steps || 20, seed: -1, image: "", last_image: "", turbo: false, gpu: "auto", ...load() };
     if (!models[st.model]) st.model = ids[0];
     const turboSteps = () => models[st.model].turbo_steps;
     const save = () => { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch { /* private mode */ } };
     let items = [], download = null, polling = false;
 
     root.innerHTML = `
-      <div class="page-head video-head"><div><h1>Video</h1><div class="sub">Video with sound, 5 to 15 seconds at 24 fps. Generation only.</div></div></div>
+      <div class="page-head">${HEAD}<div class="row" id="v-worker"></div></div>
       <div class="gen-layout">
-        <div class="card"><div class="card-body gen-form">
+        <div class="card gen-controls"><div class="card-body gen-form">
           <label class="field">Prompt<textarea id="v-prompt" rows="5" placeholder="Describe the shot: what is seen, how it moves, what is heard…"></textarea></label>
           <div class="gen-nums" style="grid-template-columns:1fr 1fr">
             <div class="field"><span>First frame <span class="help">optional</span></span><div id="v-image"></div></div>
@@ -40,11 +46,12 @@ const GenVideo = (() => {
             <label class="field">Seed<input type="number" id="v-seed" title="-1 = random each time"></label></div>
           <label class="check" id="v-turbo-row" style="font-size:13px"><input type="checkbox" id="v-turbo"> <span id="v-turbo-text"></span></label>
           <label class="field" ${ids.length > 1 ? "" : "hidden"}>Video model<select id="v-model">${ids.map((k) => `<option value="${esc(k)}">${esc(models[k].label)}</option>`).join("")}</select></label>
+          <label class="field" id="v-gpu-field" hidden>GPU<select id="v-gpu"><option value="auto">Auto</option></select></label>
           <div id="v-download"></div>
           <button class="btn btn-primary" id="v-go" style="justify-content:center;padding:10px;font-size:14px">${I.spark} Generate video</button>
-          <div class="help">Uses the GPU picked above. A video model and an image model can't be loaded on one GPU at the same time, so switching between them reloads.</div>
+          <div class="help">A video model and an image model can't be loaded on one GPU at the same time, so going between Generate and Video Generate reloads.</div>
         </div></div>
-        <div class="gen-results"><div id="v-gallery" class="video-gallery"></div></div>
+        <div class="gen-results"><div class="card" id="v-status"></div><div id="v-gallery" class="video-gallery"></div></div>
       </div>`;
 
     // ---- form
@@ -52,9 +59,9 @@ const GenVideo = (() => {
     $("#v-seconds", root).value = LENGTHS.reduce((a, b) => (Math.abs(b - st.seconds) < Math.abs(a - st.seconds) ? b : a));
     root.addEventListener("input", (e) => {
       const k = (e.target.id || "").replace(/^v-/, "");
-      if (!["prompt", "steps", "seed", "seconds", "model"].includes(k)) return;
+      if (!["prompt", "steps", "seed", "seconds", "model", "gpu"].includes(k)) return;
       if (k === "model" && !models[e.target.value]) return;
-      st[k] = k === "prompt" || k === "model" ? e.target.value : Number(e.target.value);
+      st[k] = ["prompt", "model", "gpu"].includes(k) ? e.target.value : Number(e.target.value);
       if (k === "model") {  // another model: its own step count, turbo off
         st.turbo = false;
         st.steps = (models[st.model].defaults || {}).steps || 20;
@@ -126,7 +133,8 @@ const GenVideo = (() => {
     // ---- generate
     async function submit() {
       const [width, height] = st.image ? [0, 0] : SHAPES[st.shape];
-      await guard(() => api("/api/video/generate", { method: "POST", body: { ...st, width, height, gpu: gpu() } }), "Video queued");
+      await guard(() => api("/api/video/generate", { method: "POST", body: { ...st, width, height } }), "Video queued");
+      refreshStatus();
     }
     root.addEventListener("click", async (e) => {
       const on = (sel) => e.target.closest(sel);
@@ -150,7 +158,7 @@ const GenVideo = (() => {
         for (const k of ["prompt", "steps", "seed", "model"]) $(`#v-${k}`, root).value = st[k];
         $("#v-seconds", root).value = LENGTHS.reduce((a, b) => (Math.abs(b - st.seconds) < Math.abs(a - st.seconds) ? b : a));
         renderFrames(); renderTurbo();
-        $(".video-head", root).scrollIntoView({ behavior: "smooth" });
+        window.scrollTo({ top: 0, behavior: "smooth" });
         toast("Settings loaded (same seed)", "ok");
       }
       if (on("[data-del]")) {
@@ -180,12 +188,20 @@ const GenVideo = (() => {
                 <a class="btn btn-sm" href="${fileUrl(it.file)}?download=1" title="Download MP4">${I.download}</a>
                 <button class="btn btn-sm" data-reuse title="Use these settings">${I.reuse}</button>
                 <button class="btn btn-sm" data-del title="Delete">${I.trash}</button></span></div></div></div>`).join("")
-        : `<div class="card"><div class="card-body faint" style="font-size:13px">No videos yet. The first one loads the model, which takes a few minutes.</div></div>`;
+        : `<div class="card empty" style="grid-column:1/-1">${I.image}<div>Generated videos will show up here</div></div>`;
     }
 
-    refresh();
+    // ---- status: what the GPU's worker is doing, shared with the Generate page (app.js)
+    const loaded = (g) => g.workers.some((w) => w.state !== "unloaded" && models[w.model]);
+    const refreshStatus = generationStatus({
+      st, worker: $("#v-worker", root), status: $("#v-status", root), gpuField: $("#v-gpu-field", root), gpuPick: $("#v-gpu", root),
+      idle: (g) => (loaded(g) ? "Ready. Write a prompt and hit Generate video."
+        : "The video model loads on your first video (a few minutes), then stays loaded until it's idle for 15 minutes."),
+      onNew: refresh,
+    });
+
     loadDownload();
-    return { refresh };
+    return refreshStatus;
   }
 
   return { mount };

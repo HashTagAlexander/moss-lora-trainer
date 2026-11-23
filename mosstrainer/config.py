@@ -87,7 +87,7 @@ MODEL_SPECS = {
     "briaai/Fibo-2.0-edit-turbo": {
         "label": "Fibo 2.0 Edit Turbo (4 steps, generation only)", "family": "fibo2", "trainable": False,
         "gated": True, "edit": True, "defaults": _FIBO_TURBO_DEFAULTS},
-    # Video, Generate tab only (mosstrainer/video.py): Sulphur 3's pruned single file, Comfy-Org's int8 text encoder
+    # Video, the Video Generate page only (mosstrainer/video.py): Sulphur 3's pruned single file, Comfy-Org's int8 text encoder
     # and the rest of MiniMax H3's own pipeline. "kind": "video" keeps it out of the image and training model lists.
     "sulphur-3": {
         "label": "Sulphur 3 (MiniMax H3 video, generation only)", "family": "h3", "kind": "video", "trainable": False,

@@ -1737,7 +1737,7 @@ def delete_generation(filename: str):
     return {"ok": True}
 
 
-# --------------------------------------------------------------------------- video (Generate tab, Sulphur 3)
+# --------------------------------------------------------------------------- video (Video Generate page, Sulphur 3)
 
 VIDEOS = GENERATIONS / "videos"
 
