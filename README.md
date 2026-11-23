@@ -25,6 +25,7 @@ with a frozen Qwen3.5-9B text encoder and the FLUX.2 VAE.
 | `krea2-raw`, `krea2-turbo` | Krea 2 | raw ✓ / turbo generate only | from Comfy-Org/Krea-2 |
 | `briaai/Fibo-2.0-dev` | Fibo 2.0 | ✓ | gated. Bria's full base model: 50 steps, CFG 5. Text-to-image and editing |
 | `briaai/Fibo-2.0-edit-turbo` | Fibo 2.0 | generate only | gated. 4 steps, CFG 1, made for editing a source image. LoRAs trained on Dev work on it |
+| `sulphur-3` | MiniMax H3 (video) | generate only | [SulphurAI/Sulphur-3](https://huggingface.co/SulphurAI/Sulphur-3): video with sound, in the Generate tab's Video section, 20 steps or 8 with Turbo. About 80 GB. See [Video](#video-sulphur-3) |
 
 Krea 2 models use diffusers' `Krea2Transformer2DModel` with the public Qwen3-VL-4B-Instruct text encoder and the
 Qwen-Image VAE (both byte-identical to what Krea 2 ships). Kroma LoRAs are saved in diffusers format
@@ -227,6 +228,34 @@ cache like the base models.
   The main prompt still decides the composition, so say there where things are. With CFG above 1 the negative prompt
   stays global.
 
+## Video (Sulphur 3)
+
+The Generate tab has a **Video** section under the images: [Sulphur 3](https://huggingface.co/SulphurAI/Sulphur-3), a
+fine-tune of MiniMax H3. It makes video and a stereo soundtrack in one pass, 5 to 15 seconds at 24 fps, from a prompt
+and optionally a first and/or last frame. Generation only: there is no video training here.
+
+- **What it downloads** (about 80 GB, with **Download** in the Video section or under Settings, or `MODELS="… sulphur-3"`
+  for setup): `s3.safetensors` (40 GB, the file its author recommends), Comfy-Org's **int8** Qwen3-VL 32B text
+  encoder (27 GB instead of 67), MiniMax H3's own video and audio decoders (11 GB) and the turbo LoRA (1.4 GB).
+- **Memory**: about 73 GB of weights, so everything stays loaded together on a 96 GB card. The text encoder is kept as
+  int8 on the GPU (`mosstrainer/int8_convrot.py` runs ComfyUI's ConvRot format as stored). An image model and the video
+  model can't be loaded on one GPU together; switching between them reloads. With a second GPU, pick one for each.
+- **Settings**: 768 px short side in five shapes, or the first frame's own shape. Steps default to 20, as in the
+  author's example workflow. The model is guidance-distilled, so there is no negative prompt and no CFG.
+- **Turbo**: 8 steps instead of 20, with [lightx2v's 8-step LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+  (`minimax_h3_fl2v_turbo_8step_v1.0_768p`, the version its authors run) added at run time and the video shift set to
+  6, as they recommend (audio stays at 3). It was distilled from stock MiniMax H3, not from Sulphur, so expect some
+  quality cost. Its newer v1.2 can't be used: it also changes layers that Sulphur's pruned file no longer has.
+- **Prompts**: H3 was trained on long, structured descriptions; MiniMax's own prompt rewriter is not part of the
+  open release, so describe the shot, the motion and the sound yourself
+  ([their writing guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)).
+- **How it is loaded**: `s3.safetensors` is a "pruned" H3 file (the timestep MLP and full-width AdaLN weights replaced
+  by a small table), which diffusers refuses; `mosstrainer/video.py` fits that table into diffusers' own
+  `MiniMaxH3Transformer3DModel` and runs diffusers' `MiniMaxH3ModularPipeline`. Not supported: the corrector, the
+  reference-image (`ref2va`) variant, the quantized video models and LoRAs other than the turbo one.
+- **Licence**: Sulphur 3 inherits the MiniMax H3 Community License, which grants rights only outside the EU, the UK,
+  South Korea and the USA. Read it before using the model.
+
 ## Edit Pairs app (macOS)
 
 `tools/EditPairs` is a small Mac app for building edit-pair datasets. Drop source (control) images on one side and
@@ -267,6 +296,7 @@ then open `tools/EditPairs/Edit Pairs.app` (or move it to Applications).
 python tests/smoke_test.py        # tiny random MOSS model on CPU: caching, training, sampling, save, resume
 python tests/smoke_test_krea2.py  # tiny random Krea 2 stack, checked against diffusers' Krea2Pipeline
 python tests/smoke_test_fibo2.py  # tiny random Fibo 2.0 stack, checked against diffusers' BriaFibo2Pipeline
+python tests/smoke_test_video.py  # Sulphur 3's two loaders and an MP4, on diffusers' tiny H3 pipeline
 python -m server.app --port 9090
 ```
 

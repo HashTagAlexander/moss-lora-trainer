@@ -1171,7 +1171,8 @@ async function pageGenerate(params) {
         <button class="btn btn-primary" id="g-go">${I.spark} Generate</button>
       </div></div>
       <div class="gen-results"><div class="card" id="g-status"></div><div id="g-tools" class="gen-tools"></div><div id="g-gallery" class="gen-gallery"></div><div id="g-more"></div></div>
-    </div>`;
+    </div>
+    <div id="g-video"></div>`;
 
   // ---- form <-> state
   const fields = { prompt: "#g-prompt", negative: "#g-negative", width: "#g-w", height: "#g-h", steps: "#g-steps", cfg: "#g-cfg",
@@ -1224,6 +1225,7 @@ async function pageGenerate(params) {
   }
   renderSource();
   const extras = GenExtras.mount({ st, save: () => saveGenState(st), krea: () => family() === "krea2", onSource: renderSource });
+  const video = GenVideo.mount($("#g-video"), { gpu: () => st.gpu });
   $("#g-vgl").onclick = async () => {
     const out = await VGL.open({ prompt: st.prompt, width: st.width, height: st.height });
     if (out == null) return;
@@ -1349,7 +1351,7 @@ async function pageGenerate(params) {
           <div class="muted" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(where(w))}${esc(w.current.prompt)}</div>
           <button class="btn btn-sm" data-cancel="${esc(w.current.id)}">${I.stop} Cancel</button></div>
           <div class="progress big"><div style="width:${(frac * 100).toFixed(1)}%"></div></div>
-          <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}` : esc(w.message || "Preparing…")}</div></div>`;
+          <div class="faint mono" style="font-size:12px;margin-top:6px">${p ? (w.current.kind === "video" ? `video · step ${p.step}/${p.steps}` : `image ${p.image + 1}/${p.count} · step ${p.step}/${p.steps}`) : esc(w.message || "Preparing…")}</div></div>`;
       }
       if (w.queue.length) html += line(`${esc(where(w))}${w.queue.length} more queued`);
       if (w.training && (w.current || w.queue.length)) html += line(`${esc(w.training)} is training on ${many ? `GPU ${w.gpu}` : "the GPU"}, so the text encoder stays off the GPU and new prompts encode a little slower.`);
@@ -1357,7 +1359,7 @@ async function pageGenerate(params) {
     }
     if (!html) html = `<div class="card-body faint" style="font-size:13px">${g.workers.some((w) => w.state !== "unloaded") ? "Ready. Write a prompt and hit Generate." : "The model loads on your first generation (about a minute), then stays loaded until it's idle for 15 minutes."}</div>`;
     $("#g-status").innerHTML = html;
-    if (g.version !== lastVersion) { lastVersion = g.version; loadGallery(); }
+    if (g.version !== lastVersion) { lastVersion = g.version; loadGallery(); video.refresh(); }
   }
   $("#g-status").onclick = async (e) => {
     const c = e.target.closest("[data-cancel]");

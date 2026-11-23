@@ -15,7 +15,7 @@ vast.ai console → **Templates** → **New Template** (or **+ Create**), then f
 | Jupyter direct HTTPS | **Ticked** (turns on HTTPS for everything served through vast's portal proxy) |
 | On-start script | **`entrypoint.sh`**: this starts vast's portal and runs the provisioning script. Don't put anything else here |
 | Extra filters | `cpu_arch in ['arm64', 'amd64'] cuda_max_good>=12.8` |
-| Disk space | **150 GB** (weights ≈ 30–35 GB per model family, plus caches, checkpoints and the venv) |
+| Disk space | **150 GB** (weights ≈ 30–35 GB per model family, plus caches, checkpoints and the venv). **250 GB** if you also want video (Sulphur 3 adds about 80 GB) |
 | Visibility | Private |
 
 **Docker options**: paste this as one line:

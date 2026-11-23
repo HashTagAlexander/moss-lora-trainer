@@ -307,6 +307,14 @@ pre.log { background: #07090c; border: 1px solid var(--border); border-radius: v
 .mask-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .55; cursor: crosshair; touch-action: none; }
 .mask-tools { gap: 10px; margin-top: 12px; }
 
+/* ---------- generate: video section ---------- */
+#g-video { margin-top: 36px; padding-top: 8px; border-top: 1px solid var(--border); }
+.video-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+.video-card { overflow: hidden; }
+.video-card video { display: block; width: 100%; height: auto; background: #000; }
+.video-card .btn { padding: 4px 6px; }
+.video-prompt { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 8px; }
+
 /* ---------- VGL editor / layout ---------- */
 .modal.vgl-editor, .vgl-editor { width: 100%; max-width: 1180px; max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
 .vgl-tabs { margin: 0; border: 0; }

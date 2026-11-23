@@ -27,7 +27,7 @@ RunPod console → **My Templates** → **New Template**, then fill in:
 | Container image | an official `runpod/pytorch` image (any recent tag). Setup installs its own newer torch into the venv, so the tag doesn't matter much |
 | Container start command | see below |
 | Container disk | **30 GB** (temporary files only) |
-| Volume disk | **150 GB** (weights ≈ 30 GB per model family, plus caches, checkpoints and the venv) |
+| Volume disk | **150 GB** (weights ≈ 30 GB per model family, plus caches, checkpoints and the venv). **250 GB** if you also want video (Sulphur 3 adds about 80 GB) |
 | Volume mount path | `/workspace` |
 | Expose HTTP ports | `9090` (add `8888` too if you want the image's Jupyter) |
 | Expose TCP ports | `22` (SSH) |

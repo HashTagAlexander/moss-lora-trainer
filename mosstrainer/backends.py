@@ -906,6 +906,9 @@ class Fibo2Backend(Backend):
 
 def get_backend(model_id: str) -> Backend:
     family = model_spec(model_id)["family"]
+    if family == "h3":  # video (Generate tab only): its own kind of backend, see mosstrainer/video.py
+        from .video import VideoBackend
+        return VideoBackend(model_id)
     return {"moss": MossBackend, "krea2": Krea2Backend, "fibo2": Fibo2Backend}[family](model_id)
 
 

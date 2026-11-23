@@ -87,6 +87,17 @@ MODEL_SPECS = {
     "briaai/Fibo-2.0-edit-turbo": {
         "label": "Fibo 2.0 Edit Turbo (4 steps, generation only)", "family": "fibo2", "trainable": False,
         "gated": True, "edit": True, "defaults": _FIBO_TURBO_DEFAULTS},
+    # Video, Generate tab only (mosstrainer/video.py): Sulphur 3's pruned single file, Comfy-Org's int8 text encoder
+    # and the rest of MiniMax H3's own pipeline. "kind": "video" keeps it out of the image and training model lists.
+    "sulphur-3": {
+        "label": "Sulphur 3 (MiniMax H3 video, generation only)", "family": "h3", "kind": "video", "trainable": False,
+        "repo": "SulphurAI/Sulphur-3", "file": "s3.safetensors", "base": "MiniMaxAI/MiniMax-H3",
+        "text_encoder": ["Comfy-Org/MiniMax-H3", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"],
+        # lightx2v's 8-step distillation of H3, the version its authors run (8 steps, video shift 6). Its newer
+        # v1.2 also has LoRAs on the AdaLN projections, which the pruned Sulphur file no longer has at full width.
+        "turbo": {"repo": "lightx2v/Minimax-h3-Turbo", "file": "minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors",
+                  "steps": 8, "shift": 6.0},
+        "defaults": {"steps": 20, "seconds": 5}},
 }
 
 # Krea 2 / Kroma train and run edit LoRAs too (ostris' reference-image contract, see backends.Krea2Backend).
@@ -98,7 +109,8 @@ for _spec in MODEL_SPECS.values():
 if os.environ.get("MOSS_EXTRA_MODELS"):
     MODEL_SPECS.update(json.loads(open(os.environ["MOSS_EXTRA_MODELS"]).read()))
 
-MODELS = {k: v["label"] for k, v in MODEL_SPECS.items()}
+MODELS = {k: v["label"] for k, v in MODEL_SPECS.items() if v.get("kind") != "video"}
+VIDEO_MODELS = {k: v["label"] for k, v in MODEL_SPECS.items() if v.get("kind") == "video"}
 TRAINABLE = {k: v["label"] for k, v in MODEL_SPECS.items() if v.get("trainable")}
 
 

@@ -12,6 +12,10 @@ Requests:
                put back at every step), "strength", "ref": {...}, "keep": paste the result into the source},
    "control": {"type": "depth" | "pose" | "canny", "image": path of the map, "lora": path, "strength", "ref"},
    "regions": [{"x", "y", "w", "h" (0-1 of the picture), "prompt"}]}
+  {"cmd": "generate", "kind": "video", "id", "model", "prompt", "seconds", "width", "height" (0 = the first
+   frame's shape, or 16:9), "steps", "seed", "image" / "last_image" (optional first / last frame paths),
+   "turbo" (use the model's step-distillation LoRA), "out_dir"}
+      one MP4 with sound in <out_dir>/videos (mosstrainer/video.py)
   {"cmd": "offload"}   move the text encoder to CPU (e.g. because training started)
 SIGUSR1 cancels the generation in progress. The worker exits after `--idle` seconds without requests.
 """
@@ -69,12 +73,13 @@ class Worker:
         self.transformer = None
         self.vae = None
         self.loras = None
+        self.video = None  # a loaded video model (mosstrainer.video.VideoBackend) takes the place of an image model
         self.embeds: OrderedDict[str, torch.Tensor] = OrderedDict()
         self.cancel = False
 
     # ---- model lifecycle
     def load(self, model_id: str, low_vram: bool):
-        if self.model_id == model_id:
+        if self.model_id == model_id and self.video is None:
             return
         self.free()
         emit(event="status", state="loading", message=f"Loading {model_id.split('/')[-1]} (first time downloads it)…")
@@ -91,7 +96,7 @@ class Worker:
         emit(event="status", state="ready", model=model_id, message="Model loaded")
 
     def free(self):
-        self.te = self.transformer = self.vae = self.loras = self.backend = None
+        self.te = self.transformer = self.vae = self.loras = self.backend = self.video = None
         self.model_id = None
         self.embeds.clear()
         gc.collect()
@@ -126,7 +131,69 @@ class Worker:
         return emb
 
     # ---- requests
+    def generate_video(self, req: dict):
+        from PIL import Image, ImageOps
+
+        from .video import FPS, VideoBackend, save_video
+        rid, model_id = req["id"], req["model"]
+        if self.model_id != model_id or self.video is None:
+            self.free()
+            emit(event="status", state="loading", message=f"Loading {model_id} (first time downloads it)…")
+            self.video = VideoBackend(model_id).load(
+                self.device, lambda message: emit(event="status", state="loading", message=message))
+            self.model_id = model_id
+            emit(event="status", state="ready", model=model_id, message="Model loaded")
+
+        def frame(key):
+            if not req.get(key):
+                return None
+            with Image.open(req[key]) as im:
+                return ImageOps.exif_transpose(im).convert("RGB")
+
+        steps, turbo = int(req.get("steps", 20)), bool(req.get("turbo"))
+        self.video.set_turbo(turbo)
+        seed = int(req.get("seed", -1))
+        if seed < 0:
+            seed = random.randint(0, 2**31 - 1)
+        cancelled = []
+
+        def progress(step, total):
+            if self.cancel:
+                cancelled.append(True)
+                raise Cancelled()
+            emit(event="progress", id=rid, image=0, count=1, step=step, steps=total)
+
+        emit(event="status", state="generating", message="Encoding prompt…")
+        t0 = time.time()
+        try:
+            frames, audio, rate, width, height = self.video.generate(
+                req["prompt"], seconds=float(req.get("seconds", 5)), width=int(req.get("width") or 0),
+                height=int(req.get("height") or 0), steps=steps, seed=seed, image=frame("image"),
+                last_image=frame("last_image"), progress=progress)
+        except Exception:
+            if cancelled:  # diffusers wraps what a step raises
+                raise Cancelled()
+            raise
+        out_dir = Path(req["out_dir"]) / "videos"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{rid}"
+        emit(event="status", state="generating", message="Saving the video…")
+        save_video(frames, audio, rate, out_dir / f"{stem}.mp4")
+        thumb = frames[0].copy()
+        thumb.thumbnail((640, 640))
+        thumb.convert("RGB").save(out_dir / f"{stem}.thumb.jpg", quality=85)
+        meta = {"model": model_id, "prompt": req["prompt"], "steps": steps, "seed": seed, "width": width,
+                "height": height, "frames": len(frames), "seconds": round(len(frames) / FPS, 2), "fps": FPS,
+                "image_id": req.get("image_id"), "last_image_id": req.get("last_image_id"), "turbo": turbo,
+                "created": time.time(),
+                "took": round(time.time() - t0, 1)}
+        (out_dir / f"{stem}.json").write_text(json.dumps(meta, indent=2))
+        emit(event="image", id=rid, file=f"{stem}.mp4", index=0, kind="video")
+        emit(event="done", id=rid)
+
     def generate(self, req: dict):
+        if req.get("kind") == "video":
+            return self.generate_video(req)
         rid = req["id"]
         low_vram = bool(req.get("low_vram"))
         self.load(req["model"], low_vram)

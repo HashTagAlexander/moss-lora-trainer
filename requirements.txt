@@ -13,3 +13,4 @@ python-multipart>=0.0.9
 bitsandbytes>=0.45
 prodigyopt>=1.1
 scipy>=1.11  # ViTPose's image processor (pose maps in the Generate tab)
+av>=14  # MP4 with sound for the Generate tab's video section (PyAV; bundles ffmpeg)

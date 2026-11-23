@@ -37,7 +37,7 @@ from mosstrainer import addons, captioner  # noqa: E402
 from mosstrainer.edits import (EDITS_FILE, caption_file, dataset_path, edit_row_problem,  # noqa: E402
                                is_edit_dataset, read_edit_rows, write_edit_rows)
 from mosstrainer.config import (DEFAULTS, FAMILY_TARGETS, MODEL_SPECS, MODELS, NAME_RE, TRAINABLE,  # noqa: E402
-                                validate)
+                                VIDEO_MODELS, validate)
 
 WORKSPACE = Path(os.environ.get("MOSS_WORKSPACE", ROOT / "workspace")).resolve()
 DATASETS = WORKSPACE / "datasets"
@@ -453,7 +453,8 @@ class GenWorker:
 
     def snapshot(self, training):
         with self.lock:
-            brief = lambda r: {"id": r["id"], "prompt": r.get("prompt", "")[:200], "count": r.get("count", 1)}  # noqa: E731
+            brief = lambda r: {"id": r["id"], "prompt": r.get("prompt", "")[:200], "count": r.get("count", 1),  # noqa: E731
+                               "kind": r.get("kind", "image")}
             cur = None
             if self.current:
                 cur = {**brief(self.current), "progress": self.current.get("progress"),
@@ -739,6 +740,9 @@ def info():
                  "gated": bool(v.get("gated")), "edit": bool(v.get("edit")), "defaults": v.get("defaults", {}),
                  "overrides": v.get("overrides", {})} for k, v in MODEL_SPECS.items()}
     return {"defaults": DEFAULTS, "models": MODELS, "trainable": TRAINABLE, "model_specs": specs,
+            "video_models": {k: {"label": v, "defaults": MODEL_SPECS[k].get("defaults", {}),
+                                 "turbo_steps": (MODEL_SPECS[k].get("turbo") or {}).get("steps")}
+                             for k, v in VIDEO_MODELS.items()},
             "families": FAMILY_TARGETS, "workspace": str(WORKSPACE), "auth": bool(PASSWORD)}
 
 
@@ -1487,7 +1491,7 @@ async def generate(request: Request):
     if not prompt:
         raise HTTPException(400, "Write a prompt first")
     model = body.get("model") or DEFAULTS["model"]
-    if model not in MODEL_SPECS:
+    if model not in MODELS:
         raise HTTPException(400, "Unknown model")
     d = MODEL_SPECS[model].get("defaults", {})
     try:
@@ -1730,6 +1734,73 @@ def delete_generation(filename: str):
     stem = png.name[:-len(".png")] if png.name.endswith(".png") else png.stem
     for suffix in (".png", ".thumb.jpg", ".json"):
         (GENERATIONS / f"{stem}{suffix}").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- video (Generate tab, Sulphur 3)
+
+VIDEOS = GENERATIONS / "videos"
+
+
+@app.post("/api/video/generate")
+async def generate_video(request: Request):
+    body = await request.json()
+    prompt = str(body.get("prompt", "")).strip()
+    if not prompt:
+        raise HTTPException(400, "Write a prompt first")
+    model = body.get("model") or next(iter(VIDEO_MODELS), None)
+    if model not in VIDEO_MODELS:
+        raise HTTPException(400, "Unknown video model")
+    d = MODEL_SPECS[model].get("defaults", {})
+    try:
+        seconds, steps = float(body.get("seconds", d.get("seconds", 5))), int(body.get("steps", d.get("steps", 20)))
+        width, height, seed = int(body.get("width") or 0), int(body.get("height") or 0), int(body.get("seed", -1))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Invalid number in settings")
+    if not 5 <= seconds <= 15:
+        raise HTTPException(400, "A video is 5 to 15 seconds long")
+    if not 1 <= steps <= 100:
+        raise HTTPException(400, "Steps must be 1-100")
+    if bool(width) != bool(height) or (width and not (256 <= width <= 2048 and 256 <= height <= 2048)):
+        raise HTTPException(400, "Width and height must both be set (256-2048), or both left empty")
+    turbo = bool(body.get("turbo"))
+    if turbo and not MODEL_SPECS[model].get("turbo"):
+        raise HTTPException(400, "This video model has no turbo LoRA")
+    req = {"kind": "video", "model": model, "prompt": prompt, "seconds": seconds, "steps": steps, "width": width,
+           "height": height, "seed": seed, "turbo": turbo}
+    for key, what in (("image", "first frame"), ("last_image", "last frame")):
+        if body.get(key):
+            src = _input_or_400(body[key], what)
+            req.update({key: str(src), f"{key}_id": src.name})
+    want = str(body.get("gpu", "auto"))
+    try:
+        return {"id": gen_manager.submit(req, int(want) if want.isdigit() else "auto")}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/videos")
+def list_videos(limit: int = 60, offset: int = 0):
+    metas = sorted(VIDEOS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if VIDEOS.is_dir() else []
+    return {"items": [{**read_json(m, {}), "file": m.with_suffix(".mp4").name, "thumb": m.with_suffix(".thumb.jpg").name}
+                      for m in metas[offset:offset + limit]], "total": len(metas)}
+
+
+@app.get("/api/videos/file/{filename}")
+def video_file(filename: str, download: int = 0):
+    path = safe_file(VIDEOS, filename)
+    if not path.exists() or path.suffix not in (".mp4", ".jpg"):
+        raise HTTPException(404)
+    # FileResponse answers Range requests, which browsers need to seek in a video
+    return FileResponse(path, filename=path.name if download else None,
+                        headers={"Cache-Control": "max-age=31536000, immutable"})
+
+
+@app.delete("/api/videos/{filename}")
+def delete_video(filename: str):
+    stem = safe_file(VIDEOS, filename).name.removesuffix(".mp4")
+    for suffix in (".mp4", ".thumb.jpg", ".json"):
+        (VIDEOS / f"{stem}{suffix}").unlink(missing_ok=True)
     return {"ok": True}
 
 
