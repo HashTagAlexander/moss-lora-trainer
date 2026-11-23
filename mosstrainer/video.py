@@ -60,13 +60,15 @@ class _CurveModulation(nn.Module):
     `MiniMaxH3AdaLayerNormModulation`, but straight from the curve coordinates (no SiLU: the curve already holds the
     activated embedding) and computed in float32, then handed over at the block's precision."""
 
-    def __init__(self, linear: nn.Linear, hidden_size: int, like: nn.Parameter):
+    def __init__(self, linear: nn.Linear, hidden_size: int, like: nn.Module):
         super().__init__()
         self.linear, self.hidden_size = linear, hidden_size
-        self._like = [like]  # a parameter of the block, for its dtype; in a list so it isn't registered twice
+        # A layer of the block, asked for its precision at every call: loading replaces the parameters themselves, so
+        # one kept from before would go on saying float32. In a list so the layer isn't registered here a second time.
+        self._like = [like]
 
     def forward(self, temb: torch.Tensor):
-        out = self.linear(temb.to(self.linear.weight.dtype)).to(self._like[0].dtype)
+        out = self.linear(temb.to(self.linear.weight.dtype)).to(self._like[0].weight.dtype)
         return out.view(-1, 6 * self.hidden_size).chunk(6, dim=-1)
 
 
@@ -89,7 +91,7 @@ def _curve_transformer(model, table: torch.Tensor):
     model.time_proj = nn.Identity()
     model.time_embedder = _CurveTimeEmbed(table)
     for block in model.transformer_blocks:
-        block.adaln_proj = _CurveModulation(block.adaln_proj.linear, block.adaln_proj.hidden_size, block.norm1.weight)
+        block.adaln_proj = _CurveModulation(block.adaln_proj.linear, block.adaln_proj.hidden_size, block.norm1)
     model.norm_out = _CurveNormOut(model.norm_out.norm, model.norm_out.linear)
     return model
 
@@ -166,7 +168,7 @@ class VideoBackend:
         self.model_id = model_id
         self.spec = model_spec(model_id)
         self.pipe = None
-        self.device = torch.device("cpu")
+        self.device, self.dtype = torch.device("cpu"), torch.float32
         self._turbo = None       # {module name: DynamicLoRALinear} once the turbo LoRA has been loaded
         self._turbo_on = False
         self._shift = None       # the pipeline's own video shift
@@ -211,14 +213,16 @@ class VideoBackend:
         return json.loads(Path(hf_hub_download(self.spec["base"], f"{part}/config.json")).read_text())
 
     # ---- loading
-    def load(self, device, status=lambda message: None):
+    def load(self, device, status=lambda message: None, dtype=None):
+        """`dtype`: the body's precision; by default bfloat16 on a GPU and float32 on the CPU. (Tests pass bfloat16 on
+        the CPU, to run the GPU's mix of bfloat16 weights and float32 islands.)"""
         from diffusers import ComponentsManager, ModularPipeline
         from transformers import Qwen3VLConfig
 
         from .int8_convrot import load_qwen3vl_int8
         self.device = device = torch.device(device)
         cuda = device.type == "cuda"
-        dtype = torch.bfloat16 if cuda else torch.float32
+        self.dtype = dtype = dtype or (torch.bfloat16 if cuda else torch.float32)
         transformer_path, te_path, base = self.prefetch()
         # With room for all the weights plus working memory (MOSS_VIDEO_RESERVE_GB, default 14), every part goes
         # straight onto the card and stays there: the case on a 96 GB card. Otherwise the parts load to RAM and
@@ -255,7 +259,7 @@ class VideoBackend:
         if on and self._turbo is None:
             from .lora import DynamicLoRALinear, _replace
             model = self.pipe.transformer
-            dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+            dtype = self.dtype
             wrapped, missing = {}, []
             for name, (a, b, scale) in read_lora(self._turbo_path()).items():
                 try:

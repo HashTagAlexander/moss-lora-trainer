@@ -64,9 +64,9 @@ class Int8Linear(nn.Module):
         h = x.float()
         if self.groupsize:
             h = (h.unflatten(-1, (-1, self.groupsize)) @ self.hadamard).flatten(-2)
-        # the integers are exact in bfloat16, so the big product can run at the model's own precision on a GPU;
-        # only the per-row scale needs float32
-        work = torch.bfloat16 if x.is_cuda else torch.float32
+        # the integers are exact in bfloat16, so in a bfloat16 model the big product runs at the model's own
+        # precision; only the rotation and the per-row scale need float32
+        work = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float32
         y = F.linear(h.to(work), self.weight.to(work)).float() * self.weight_scale
         if self.bias is not None:
             y = y + self.bias

@@ -10,6 +10,8 @@ computing the same thing, on tiny stand-ins made here in the real files' formats
     transformer with the file's rounding, on what the pipeline really feeds it,
   * the turbo LoRA (lightx2v's key layout) added at run time == the same deltas merged into the weights, with the
     video schedule on the LoRA's shift while it is on and back on the model's own afterwards,
+  * everything again in bfloat16 with float32 islands, the precision mix of a GPU (this machine's float32 would
+    hide a layer that hands on the wrong one),
 then the generation worker makes an MP4 with sound from them, with and without turbo.
 """
 import copy
@@ -168,6 +170,40 @@ def check_turbo(tmp: Path):
     assert times == [0.0, 0.0769, 0.25] and times_off == [0.0, 0.04, 0.1429]
 
 
+def check_bfloat16(tmp: Path):
+    """A GPU runs the body in bfloat16 with the input / output heads and the curve AdaLN projections in float32.
+    Every layer has to hand on the precision it was given: run that mix here, with and without turbo and with a
+    first frame, and compare with the float32 run."""
+    import numpy as np
+    from PIL import Image
+
+    import mosstrainer.config as config
+    from mosstrainer import video
+
+    config.MODEL_SPECS.update(tiny_spec(tmp))
+    runs = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        backend = video.VideoBackend("tiny-h3").load("cpu", dtype=dtype)
+        model = backend.pipe.transformer
+        assert model.dtype == dtype == backend.pipe.text_encoder.dtype
+        if dtype == torch.bfloat16:
+            kinds = {p.dtype for p in model.parameters()}
+            assert kinds == {torch.float32, torch.bfloat16}, kinds
+            assert model.transformer_blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+        for turbo in (False, True):
+            backend.set_turbo(turbo)
+            frames = backend.generate("a red fox in the snow", seconds=5, width=64, height=64, steps=3, seed=0)[0]
+            runs[dtype, turbo] = np.asarray(frames[-1]).astype(float)
+        backend.set_turbo(False)
+        framed = backend.generate("the fox turns", seconds=5, width=64, height=64, steps=2, seed=1,
+                                  image=Image.new("RGB", (64, 64), (200, 120, 40)))[0]
+        assert len(framed) == 124
+    diffs = [np.abs(runs[torch.bfloat16, t] - runs[torch.float32, t]).mean() for t in (False, True)]
+    print(f"bfloat16 run: plain, turbo and first-frame all complete; last frame vs float32 differs by "
+          f"{diffs[0]:.1f} and {diffs[1]:.1f} of 255 on average")
+    assert max(diffs) < 40
+
+
 def check_text_encoder(tmp: Path):
     from diffusers.modular_pipelines.minimax_h3.encoders import get_qwen3vl_prompt_embeds
     from mosstrainer.int8_convrot import Int8Linear, load_qwen3vl_int8, regular_hadamard
@@ -183,6 +219,9 @@ def check_text_encoder(tmp: Path):
     d_layer = (layer(x) - x @ ref_rotate(q.float() * s, 256).T).abs().max().item()
     layer.to(torch.bfloat16)  # a cast meant for the rest of the model leaves the integers and scales alone
     assert d_layer < 1e-4 and layer.weight.dtype == torch.int8 and layer.weight_scale.dtype == torch.float32
+    half = layer(x.to(torch.bfloat16))  # in a bfloat16 model the product itself runs in bfloat16
+    d_half = ((half.float() - x @ ref_rotate(q.float() * s, 256).T).abs().max() / half.float().abs().max()).item()
+    assert half.dtype == torch.bfloat16 and d_half < 0.05, d_half
 
     full = randomize(Qwen3VLForConditionalGeneration.from_pretrained(REPO, subfolder="text_encoder", dtype=torch.float32).eval(), 0.2)
     processor = AutoProcessor.from_pretrained(REPO, subfolder="processor")
@@ -287,6 +326,7 @@ def main():
         check_text_encoder(tmp)
         check_transformer(tmp)
         check_turbo(tmp)
+        check_bfloat16(tmp)
         run_worker(tmp)
         print("VIDEO SMOKE TEST PASSED")
 
